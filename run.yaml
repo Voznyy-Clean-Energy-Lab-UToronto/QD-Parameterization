@@ -1,0 +1,65 @@
+potential:
+  type: lj                         # lj, morse, buckingham, mie, yukawa, born, rydberg, double_exp, damped_buck, soft_core_lj
+  coulomb: true
+  # defaults:                      # override default param values (potential-specific)
+  #   epsilon: 0.01
+  #   sigma: 2.5
+
+training:
+  learning_rate: 1e-3
+  minimum_learning_rate: 1e-6
+  batch_size: 8
+  convergence_patience: 100
+  convergence_threshold: 1e-6
+  validation_split: 0.1
+  force_weight: 1.0
+  neutrality_penalty_weight: 0.5
+  cutoff_angstroms: 60.0
+  minimum_distance_angstroms: 0.5
+  box_size_angstrom: 27.5
+  use_smart_sigma: true
+  enforce_neutrality: true
+  enforce_element_constraints: true
+  core_elements: [Cd, Se]
+  filter_percentile: 95
+
+units:
+  energy: ev
+  distance: angstrom
+
+datasets:
+  - name: CdSe_Infante
+    xyz: cursed_test.extxyz
+
+formal_charges:
+  Cd: 2
+  Se: -2
+  C: 1
+  O: -1
+  H: 0
+
+fixed_pairs:
+  C-C: [0.001358, 3.2072]
+  H-H: [0.000092, 2.8420]
+  O-O: [0.001502, 3.2072]
+  C-H: [0.000353, 3.0191]
+  C-O: [0.001428, 3.2072]
+  H-O: [0.000372, 3.0191]
+
+initial_guesses:
+  # C-Cd: [0.0020887769, 1.9894040478]
+  # C-Se: [0.0024499183, 3.9448074845]
+  # Cd-Cd: [0.0032139609, 1.234]
+  # Cd-H: [0.0005437367, 1.8726951615]
+  # Cd-O: [0.0190080755, 2.471]
+  # Cd-Se: [0.0157796047, 2.94]
+  # H-Se: [0.0006377467, 3.7133843663]
+  # O-Se: [0.0167227534, 3.526]
+  # Se-Se: [0.0044213986, 4.852]
+
+charges:
+  # C: 0.4524
+  # H: 0.0
+  # O: -0.4704
+  # Cd: 0.9768
+  # Se: -0.9768
