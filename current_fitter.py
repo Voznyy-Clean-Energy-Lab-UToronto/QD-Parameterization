@@ -198,6 +198,100 @@ def compute_rdf_peaks(pair_names, xyz_files, box_size):
     return peak_distances
 
 
+def read_lammps_dump(filepath):
+    """Parse a LAMMPS dump file and return atom symbols, positions, and forces.
+
+    Handles column ordering from the ITEM: ATOMS header line.
+    Atoms are sorted by id for consistent ordering across frames.
+    Returns:
+        atom_symbols: list of element strings (sorted by atom id)
+        positions_list: list of (N, 3) numpy arrays in Angstrom
+        forces_list: list of (N, 3) numpy arrays in eV/Ang, or None per frame
+    """
+    positions_list = []
+    forces_list = []
+    atom_symbols = None
+
+    with open(filepath) as f:
+        while True:
+            line = f.readline()
+            if not line:
+                break
+
+            if 'ITEM: TIMESTEP' in line:
+                f.readline()  # timestep value
+                f.readline()  # ITEM: NUMBER OF ATOMS
+                n_atoms = int(f.readline().strip())
+
+                # skip BOX BOUNDS (header + 3 bound lines)
+                f.readline()  # ITEM: BOX BOUNDS ...
+                f.readline()
+                f.readline()
+                f.readline()
+
+                # parse ITEM: ATOMS header to get column mapping
+                header_line = f.readline().strip()
+                cols = header_line.replace('ITEM: ATOMS', '').split()
+                col_idx = {name: i for i, name in enumerate(cols)}
+
+                # detect position columns (xu/yu/zu preferred, fall back to x/y/z)
+                px = col_idx.get('xu', col_idx.get('x'))
+                py = col_idx.get('yu', col_idx.get('y'))
+                pz = col_idx.get('zu', col_idx.get('z'))
+                has_element = 'element' in col_idx
+                has_id = 'id' in col_idx
+                has_forces = all(k in col_idx for k in ('fx', 'fy', 'fz'))
+
+                frame_positions = np.empty((n_atoms, 3))
+                frame_forces = np.empty((n_atoms, 3)) if has_forces else None
+                frame_elements = []
+                frame_ids = np.empty(n_atoms, dtype=int)
+
+                for j in range(n_atoms):
+                    tokens = f.readline().split()
+                    frame_positions[j, 0] = float(tokens[px])
+                    frame_positions[j, 1] = float(tokens[py])
+                    frame_positions[j, 2] = float(tokens[pz])
+
+                    if has_element:
+                        frame_elements.append(tokens[col_idx['element']])
+                    if has_id:
+                        frame_ids[j] = int(tokens[col_idx['id']])
+                    else:
+                        frame_ids[j] = j
+
+                    if has_forces:
+                        frame_forces[j, 0] = float(tokens[col_idx['fx']])
+                        frame_forces[j, 1] = float(tokens[col_idx['fy']])
+                        frame_forces[j, 2] = float(tokens[col_idx['fz']])
+
+                # sort by atom id for consistent ordering
+                sort_order = np.argsort(frame_ids)
+                frame_positions = frame_positions[sort_order]
+                if has_forces:
+                    frame_forces = frame_forces[sort_order]
+                if has_element:
+                    frame_elements = [frame_elements[i] for i in sort_order]
+
+                if atom_symbols is None:
+                    if has_element:
+                        atom_symbols = frame_elements
+                    else:
+                        raise ValueError(
+                            f"LAMMPS dump {filepath}: first frame has no "
+                            "'element' column. Cannot determine atom types."
+                        )
+
+                positions_list.append(frame_positions)
+                forces_list.append(frame_forces)
+
+    if atom_symbols is None:
+        raise ValueError(f"No frames found in LAMMPS dump: {filepath}")
+
+    print(f"  Read {len(positions_list)} frames, {len(atom_symbols)} atoms")
+    return atom_symbols, positions_list, forces_list
+
+
 class DFTDataset:
     def __init__(self, dataset_configs, cutoff_angstroms,
                  min_distance_angstroms, device):
@@ -215,33 +309,50 @@ class DFTDataset:
 
         for dataset_index, dataset_config in enumerate(dataset_configs):
             dataset_name = dataset_config.get('name', f'Dataset {dataset_index}')
-            print(f"\n{dataset_name}")
-
-            frames = ase.io.read(
-                dataset_config['xyz'], index=':', format='extxyz'
-            )
-            atom_symbols = frames[0].get_chemical_symbols()
-            all_elements.update(atom_symbols)
-            print(f"  Frames: {len(frames)}")
-
-            if not frames:
-                continue
+            fmt = dataset_config.get('format', 'extxyz')
+            print(f"\n{dataset_name} (format: {fmt})")
 
             force_units = dataset_config.get('force_units', 'ev/ang')
             positions_bohr = []
             forces_au = []
 
-            for frame in frames:
-                positions_bohr.append(frame.positions * ANGSTROM_TO_BOHR)
+            if fmt == 'lammps':
+                atom_symbols, positions_ang, forces_raw = read_lammps_dump(
+                    dataset_config['xyz']
+                )
+                for pos_ang in positions_ang:
+                    positions_bohr.append(pos_ang * ANGSTROM_TO_BOHR)
+                for f_raw in forces_raw:
+                    if f_raw is not None:
+                        if force_units != 'au':
+                            forces_au.append(f_raw / FORCE_AU_TO_EV_ANG)
+                        else:
+                            forces_au.append(f_raw)
+                    else:
+                        forces_au.append(None)
+                print(f"  Frames: {len(positions_ang)}")
+            else:
+                frames = ase.io.read(
+                    dataset_config['xyz'], index=':', format='extxyz'
+                )
+                atom_symbols = frames[0].get_chemical_symbols()
+                print(f"  Frames: {len(frames)}")
 
-                try:
-                    frame_forces = frame.get_forces()
-                    if force_units != 'au':
-                        frame_forces = frame_forces / FORCE_AU_TO_EV_ANG
-                    forces_au.append(frame_forces)
-                except Exception:
-                    forces_au.append(None)
+                if not frames:
+                    continue
 
+                for frame in frames:
+                    positions_bohr.append(frame.positions * ANGSTROM_TO_BOHR)
+
+                    try:
+                        frame_forces = frame.get_forces()
+                        if force_units != 'au':
+                            frame_forces = frame_forces / FORCE_AU_TO_EV_ANG
+                        forces_au.append(frame_forces)
+                    except Exception:
+                        forces_au.append(None)
+
+            all_elements.update(atom_symbols)
             has_forces = any(f is not None for f in forces_au)
             print(f"  Forces: {'found' if has_forces else 'NOT FOUND'}")
 
