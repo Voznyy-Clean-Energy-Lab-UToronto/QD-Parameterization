@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+\#!/usr/bin/env python3
 import os
 import sys
 import time
@@ -194,21 +194,10 @@ class PhaseTimer:
 
 # ── Main ─────────────────────────────────────────────────────────────
 
-def _set_seed(seed=42):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 def main():
     if len(sys.argv) < 2:
         print("Usage: python -m gnn_morse_local <config.yaml> [--output-dir DIR]")
         sys.exit(1)
-
-    _set_seed(42)
 
     timer = PhaseTimer()
     config = load_config(sys.argv[1])
