@@ -1,0 +1,10 @@
+numpy
+torch
+torch-geometric
+torch-scatter
+ase
+scipy
+scikit-learn
+matplotlib
+pyyaml
+MDAnalysis
