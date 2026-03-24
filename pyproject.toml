@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gnn-morse"
+version = "0.1.0"
+description = "GNN-Morse: Environment-aware Morse potential fitter with LAMMPS export"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "torch-geometric>=2.4",
+    "torch-scatter>=2.1",
+    "ase>=3.22",
+    "scipy>=1.10",
+    "scikit-learn>=1.2",
+    "matplotlib>=3.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+analysis = ["MDAnalysis>=2.4"]
+
+[project.scripts]
+gnn-morse = "gnn_morse.gnn_morse_fitter:main"
+
+[tool.setuptools.packages.find]
+include = ["gnn_morse*"]
