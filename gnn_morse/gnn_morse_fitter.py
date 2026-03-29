@@ -8,6 +8,7 @@ import numpy as np
 import yaml
 import torch
 from torch_geometric.loader import DataLoader
+from scipy.signal import argrelmax
 
 from .utils import (
     HARTREE_TO_EV, BOHR_TO_ANGSTROM, EV_TO_HARTREE, ANGSTROM_TO_BOHR,
@@ -19,28 +20,29 @@ from .lammps_export import export_lammps
 from .plotting import generate_all_plots
 
 
+# ── Logging (tee to both console and file) ───────────────────────────
+
+class _TeeStream:
+    def __init__(self, stream, handler):
+        self.stream = stream
+        self.handler = handler
+    def write(self, data):
+        self.stream.write(data)
+        if data:
+            self.handler.stream.write(data)
+            self.handler.stream.flush()
+    def flush(self):
+        self.stream.flush()
+
+
 def _setup_logging(log_path):
-    fmt = logging.Formatter('%(message)s')
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    fh = logging.FileHandler(log_path, mode='w')
-    fh.setFormatter(fmt)
-    root.addHandler(fh)
-    # Also tee stdout/stderr to the log file
-    class _TeeStream:
-        def __init__(self, stream, handler):
-            self.stream = stream
-            self.handler = handler
-        def write(self, data):
-            self.stream.write(data)
-            if data.strip():
-                self.handler.stream.write(data)
-                self.handler.stream.flush()
-        def flush(self):
-            self.stream.flush()
-    sys.stdout = _TeeStream(sys.stdout, fh)
-    sys.stderr = _TeeStream(sys.stderr, fh)
-    return fh
+    handler = logging.FileHandler(log_path, mode='w')
+    handler.setFormatter(logging.Formatter('%(message)s'))
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().addHandler(handler)
+    sys.stdout = _TeeStream(sys.stdout, handler)
+    sys.stderr = _TeeStream(sys.stderr, handler)
+    return handler
 
 
 # ── Config ───────────────────────────────────────────────────────────
@@ -55,54 +57,50 @@ def load_config(filepath):
     config.update(raw.get('training', {}))
     config['datasets'] = raw.get('datasets', [])
     if not config['datasets']:
-        raise ValueError("Config must specify at least one dataset under 'datasets'")
+        raise ValueError("Config must have at least one dataset")
 
-    # Resolve relative xyz paths relative to config file location
+    # Resolve relative xyz paths
     for ds in config['datasets']:
         if 'xyz' in ds and not os.path.isabs(ds['xyz']):
             ds['xyz'] = os.path.normpath(os.path.join(config_dir, ds['xyz']))
 
-    # KNN config
     config['knn_edges'] = raw['knn_edges']
-
-    # GNN config
     config['gnn'] = raw['gnn']
 
-    # Fixed pairs
+    # Fixed pairs (frozen during training)
     fixed_raw = raw.get('fixed_pairs') or {}
     config['fixed_pairs'] = {}
-    for name, values in fixed_raw.items():
-        if isinstance(values, dict):
-            config['fixed_pairs'][name] = {k: float(v) for k, v in values.items()}
-        elif isinstance(values, (list, tuple)):
+    for name, vals in fixed_raw.items():
+        if isinstance(vals, dict):
+            config['fixed_pairs'][name] = {k: float(v) for k, v in vals.items()}
+        elif isinstance(vals, (list, tuple)):
             config['fixed_pairs'][name] = {
-                'D_e': float(values[0]), 'alpha': float(values[1]), 'r0': float(values[2])}
+                'D_e': float(vals[0]), 'alpha': float(vals[1]), 'r0': float(vals[2])}
 
-    # Initial guesses
+    # Initial guesses (optional starting values, still trained)
     ig_raw = raw.get('initial_guesses') or {}
     config['initial_guesses'] = {}
-    for name, values in ig_raw.items():
-        if isinstance(values, dict):
-            config['initial_guesses'][name] = {k: float(v) for k, v in values.items()}
+    for name, vals in ig_raw.items():
+        if isinstance(vals, dict):
+            config['initial_guesses'][name] = {k: float(v) for k, v in vals.items()}
 
-    # Cast numeric fields (PyYAML reads 1e-3 as string)
+    # Ensure numeric types (PyYAML reads 1e-3 as string sometimes)
     for key in ('learning_rate', 'minimum_learning_rate', 'convergence_threshold',
-                'validation_split', 'weight_decay', 'energy_weight', 'max_hours',
-                'box_size_angstrom'):
+                'validation_split', 'weight_decay', 'max_hours', 'box_size_angstrom'):
         if key in config:
             config[key] = float(config[key])
 
-    # LAMMPS data file path (optional) — configs use 'original_data', fallback to 'lammps_data_file'
-    od = raw.get('original_data') or raw.get('lammps_data_file')
-    if od and not os.path.isabs(od):
-        od = os.path.normpath(os.path.join(config_dir, od))
-    config['original_data'] = od
+    # Original LAMMPS .data file (for atom type remapping)
+    original_data = raw.get('original_data') or raw.get('lammps_data_file')
+    if original_data and not os.path.isabs(original_data):
+        original_data = os.path.normpath(os.path.join(config_dir, original_data))
+    config['original_data'] = original_data
 
     print(f"Loaded config: {filepath}")
     return config
 
 
-# ── RDF-based r0 initialization ─────────────────────────────────────
+# ── RDF peak detection (for smart r0 + D_e initialization) ──────────
 
 def compute_rdf_peaks(pair_names, xyz_files, box_size):
     try:
@@ -114,37 +112,35 @@ def compute_rdf_peaks(pair_names, xyz_files, box_size):
 
     print("\nComputing equilibrium distances from RDF...")
     peaks = {}
-    box_dims = [box_size, box_size, box_size, 90.0, 90.0, 90.0]
+    box = [box_size, box_size, box_size, 90.0, 90.0, 90.0]
 
     for xyz_path in xyz_files:
         if not os.path.exists(xyz_path):
             continue
         try:
-            u = mda.Universe(xyz_path, topology_format='XYZ')
-            u.dimensions = box_dims
+            universe = mda.Universe(xyz_path, topology_format='XYZ')
+            universe.dimensions = box
 
-            for pn in pair_names:
-                if pn in peaks:
+            for pair_name in pair_names:
+                if pair_name in peaks:
                     continue
-                e1, e2 = pn.split('-')
-                sel1 = u.select_atoms(f"name {e1}")
-                sel2 = u.select_atoms(f"name {e2}")
-                if len(sel1) == 0 or len(sel2) == 0:
+                elem_a, elem_b = pair_name.split('-')
+                group_a = universe.select_atoms(f"name {elem_a}")
+                group_b = universe.select_atoms(f"name {elem_b}")
+                if len(group_a) == 0 or len(group_b) == 0:
                     continue
 
-                rdf = InterRDF(sel1, sel2, nbins=200, range=(0.5, 8.0))
+                rdf = InterRDF(group_a, group_b, nbins=200, range=(0.5, 8.0))
                 rdf.run()
-                r = rdf.results.bins
-                g = rdf.results.rdf
 
-                # Find first peak
-                from scipy.signal import argrelmax
                 try:
-                    peak_idx = argrelmax(g, order=5)[0]
-                    if len(peak_idx) > 0:
-                        r_peak = r[peak_idx[0]]
-                        peaks[pn] = r_peak * ANGSTROM_TO_BOHR
-                        print(f"  {pn}: r0 = {r_peak:.3f} A")
+                    peak_indices = argrelmax(rdf.results.rdf, order=5)[0]
+                    if len(peak_indices) > 0:
+                        first_peak = peak_indices[0]
+                        r_peak = rdf.results.bins[first_peak]
+                        g_peak = rdf.results.rdf[first_peak]
+                        peaks[pair_name] = (r_peak * ANGSTROM_TO_BOHR, g_peak)
+                        print(f"  {pair_name}: r0 = {r_peak:.3f} A, g_peak = {g_peak:.1f}")
                 except Exception:
                     pass
         except Exception as e:
@@ -153,41 +149,14 @@ def compute_rdf_peaks(pair_names, xyz_files, box_size):
     return peaks
 
 
-# ── Loss ─────────────────────────────────────────────────────────────
+# ── Force RMSE (core atoms only when mask is provided) ───────────────
 
-def compute_core_force_rmse(pred, ref, elem_idx, core_mask):
-    sq_err = (pred - ref) ** 2
+def force_rmse(predicted, reference, element_indices, core_mask):
+    squared_error = (predicted - reference) ** 2
     if core_mask is not None:
-        mask = core_mask[elem_idx].unsqueeze(1)
-        return torch.sqrt((sq_err * mask).sum() / (mask.sum() * 3) + 1e-30)
-    return torch.sqrt(sq_err.mean() + 1e-30)
-
-
-# ── Phase timer ──────────────────────────────────────────────────────
-
-class PhaseTimer:
-    def __init__(self):
-        self.phases = []
-        self._start = time.time()
-        self._phase_start = self._start
-
-    def mark(self, name):
-        now = time.time()
-        self.phases.append((name, now - self._phase_start))
-        self._phase_start = now
-
-    def summary(self):
-        total = time.time() - self._start
-        print(f"\n{'='*60}")
-        print("PHASE TIMING SUMMARY")
-        print(f"{'='*60}")
-        print(f"  {'Phase':<30} {'Time':>10} {'%':>6}")
-        print(f"  {'-'*48}")
-        for name, dt in self.phases:
-            print(f"  {name:<30} {dt:>9.1f}s {100*dt/total:>5.1f}%")
-        print(f"  {'-'*48}")
-        print(f"  {'TOTAL':<30} {total:>9.1f}s")
-        print(f"{'='*60}")
+        mask = core_mask[element_indices].unsqueeze(1)
+        return torch.sqrt((squared_error * mask).sum() / (mask.sum() * 3) + 1e-30)
+    return torch.sqrt(squared_error.mean() + 1e-30)
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -197,54 +166,47 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog='gnn-morse',
-        description='GNN-Morse: Train environment-aware Morse potentials and export to LAMMPS')
+        description='Train GNN-Morse potentials and export to LAMMPS')
     parser.add_argument('config', help='Path to config YAML file')
     parser.add_argument('--output-dir', default=None,
-                        help='Base output directory (default: directory containing config)')
+                        help='Output directory (default: config file directory)')
     parser.add_argument('--analyze', action='store_true',
-                        help='Run LAMMPS MD and full analysis after training')
+                        help='Run LAMMPS MD analysis after training')
     parser.add_argument('--infante', action='store_true',
-                        help='Include Infante reference MD in analysis (requires --analyze)')
+                        help='Include Infante reference (requires --analyze)')
     parser.add_argument('--lammps-bin', default=None,
-                        help='Path to LAMMPS binary (default: $LAMMPS_BIN or lmp)')
-    parser.add_argument('--nsteps', type=int, default=10000,
-                        help='MD steps for analysis (default: 10000)')
-    parser.add_argument('--temp', type=int, default=300,
-                        help='MD temperature in K (default: 300)')
+                        help='LAMMPS binary path (default: $LAMMPS_BIN or lmp)')
+    parser.add_argument('--nsteps', type=int, default=10000, help='MD steps')
+    parser.add_argument('--temp', type=int, default=300, help='Temperature (K)')
     args = parser.parse_args()
 
-    timer = PhaseTimer()
+    start_time = time.time()
     config = load_config(args.config)
-    timer.mark("Config loading")
 
-    output_base = args.output_dir
-    if output_base is None:
-        output_base = os.path.dirname(os.path.abspath(args.config))
-    output_base = os.path.abspath(output_base)
-
-    results_dir = os.path.join(output_base, 'results')
-    lammps_dir = os.path.join(output_base, 'lammps')
+    # Output directories
+    output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.config))
+    output_dir = os.path.abspath(output_dir)
+    results_dir = os.path.join(output_dir, 'results')
+    lammps_dir = os.path.join(output_dir, 'lammps')
     os.makedirs(results_dir, exist_ok=True)
 
     log_path = os.path.join(results_dir, 'training.log')
     log_handler = _setup_logging(log_path)
     print(f"Logging output to: {log_path}")
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     print(f"GNN: {'enabled' if config['gnn']['enabled'] else 'disabled'}")
-    lig_cut = config['knn_edges'].get('ligand_cutoff', 'N/A')
     print(f"KNN: k_cross={config['knn_edges']['k_cross']}, "
           f"max_gap_neighbors={config['knn_edges']['max_gap_neighbors']}, "
-          f"ligand_cutoff={lig_cut} A")
+          f"ligand_cutoff={config['knn_edges'].get('ligand_cutoff', 'N/A')} A")
 
-    # ── Load data (CPU) ──
+    # ── Load data ──
     dataset = DFTDataset(
         config['datasets'],
         knn_config=config['knn_edges'],
-        first_n_frames=config.get('first_n_frames'),  # None = use all
+        first_n_frames=config.get('first_n_frames'),
     )
-
-    timer.mark("Data loading")
 
     elements = dataset.elements
     pair_names = dataset.pair_names
@@ -255,30 +217,30 @@ def main():
     print(f"\nElements ({num_elements}): {elements}")
     print(f"Pairs ({num_pairs}): {pair_names}")
 
-    # ── Initialize parameters ──
+    # ── Initialize Morse parameters ──
     init_D_e = np.full(num_pairs, 0.1 * EV_TO_HARTREE)
     init_alpha = np.full(num_pairs, 1.5 * BOHR_TO_ANGSTROM)
     init_r0 = np.full(num_pairs, 3.0 * ANGSTROM_TO_BOHR)
 
-    # Apply fixed_pairs
-    frozen_pair_names = set()
+    # Frozen pairs (fixed values, not trained)
+    frozen_pairs = set()
     frozen_mask = torch.ones(num_pairs, dtype=torch.float64)
 
-    for pn, vals in config.get('fixed_pairs', {}).items():
-        if pn not in pair_name_to_index:
+    for pair_name, vals in config.get('fixed_pairs', {}).items():
+        if pair_name not in pair_name_to_index:
             continue
-        idx = pair_name_to_index[pn]
+        idx = pair_name_to_index[pair_name]
         init_D_e[idx] = vals['D_e'] * EV_TO_HARTREE
         init_alpha[idx] = vals['alpha'] * BOHR_TO_ANGSTROM
         init_r0[idx] = vals['r0'] * ANGSTROM_TO_BOHR
-        frozen_pair_names.add(pn)
+        frozen_pairs.add(pair_name)
         frozen_mask[idx] = 0.0
 
-    # Apply initial guesses
-    for pn, vals in config.get('initial_guesses', {}).items():
-        if pn not in pair_name_to_index:
+    # Initial guesses (override defaults but still trained)
+    for pair_name, vals in config.get('initial_guesses', {}).items():
+        if pair_name not in pair_name_to_index:
             continue
-        idx = pair_name_to_index[pn]
+        idx = pair_name_to_index[pair_name]
         if 'D_e' in vals:
             init_D_e[idx] = vals['D_e'] * EV_TO_HARTREE
         if 'alpha' in vals:
@@ -286,41 +248,37 @@ def main():
         if 'r0' in vals:
             init_r0[idx] = vals['r0'] * ANGSTROM_TO_BOHR
 
-    # Smart r0 from RDF peaks
+    # Smart initialization from RDF: r0 from peak position, D_e from PMF (kT * ln(g_peak))
     if config.get('use_smart_r0'):
         xyz_files = [ds['xyz'] for ds in config['datasets']]
-        peaks = compute_rdf_peaks(pair_names, xyz_files,
-                                  config['box_size_angstrom'])
-        for pn, r0_bohr in peaks.items():
-            if pn not in frozen_pair_names and pn in pair_name_to_index:
-                init_r0[pair_name_to_index[pn]] = r0_bohr
-    timer.mark("RDF peak computation")
+        peaks = compute_rdf_peaks(pair_names, xyz_files, config['box_size_angstrom'])
+        kT_eV = 8.617e-5 * 300.0
+        for pair_name, (r0_bohr, g_peak) in peaks.items():
+            if pair_name not in frozen_pairs and pair_name in pair_name_to_index:
+                idx = pair_name_to_index[pair_name]
+                init_r0[idx] = r0_bohr
+                if g_peak > 1.0:
+                    init_D_e[idx] = kT_eV * np.log(g_peak) * EV_TO_HARTREE
 
-    # ── Build graphs (CPU precompute) ──
+    # ── Build graphs ──
     dataset.build_graphs()
-
-    timer.mark("Graph building")
-
     if not dataset.graphs:
         print("ERROR: No graphs built!")
         sys.exit(1)
 
-    # ── Train/val split (temporal — last val_frac of trajectory) ──
+    # ── Train/val split (temporal: last portion is validation) ──
     n_total = len(dataset.graphs)
     n_val = max(1, int(n_total * config['validation_split']))
     n_train = n_total - n_val
 
-    train_graphs = dataset.graphs[:n_train]
-    val_graphs = dataset.graphs[n_train:]
-
     batch_size = config['batch_size']
-    train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_graphs, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(dataset.graphs[:n_train], batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(dataset.graphs[n_train:], batch_size=batch_size, shuffle=False)
 
     print(f"\nTrain: {n_train} frames (0-{n_train-1}), "
           f"Val: {n_val} frames ({n_train}-{n_total-1}), Batch: {batch_size}")
 
-    # ── Create model (move to device for training) ──
+    # ── Create model ──
     model = GNNMorseModel(
         num_pairs=num_pairs,
         num_elements=num_elements,
@@ -334,229 +292,243 @@ def main():
 
     frozen_mask = frozen_mask.to(device)
 
-    # Core mask for force loss
-    core_elements = config.get('core_elements', [])  # optional
+    # Core element mask (loss computed only on these atoms)
+    core_elements = config.get('core_elements', [])
     if core_elements:
         core_mask = torch.zeros(num_elements, dtype=torch.float64, device=device)
-        for ce in core_elements:
-            if ce in dataset.element_to_index:
-                core_mask[dataset.element_to_index[ce]] = 1.0
+        for elem in core_elements:
+            if elem in dataset.element_to_index:
+                core_mask[dataset.element_to_index[elem]] = 1.0
         print(f"Core elements for loss: {core_elements}")
     else:
         core_mask = None
 
-    # Disable energy offset if not using energy
-    energy_weight = config['energy_weight']
-    use_energy = energy_weight > 0
-    if not use_energy:
-        model.energy_offset.requires_grad_(False)
-        print("Energy matching: disabled (force-only training)")
-    else:
-        print(f"Energy matching: weight = {energy_weight}")
+    print(f"Force-only training (no energy matching)")
 
-    # Count parameters
+    # Parameter count
     n_base = sum(p.numel() for p in [model.raw_D_e, model.raw_alpha, model.raw_r0])
-    n_gnn = sum(p.numel() for n, p in model.named_parameters()
-                if 'env_encoder' in n or 'param_predictor' in n)
+    n_gnn = sum(p.numel() for name, p in model.named_parameters()
+                if 'env_encoder' in name or 'param_predictor' in name)
     n_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_base} base Morse + {n_gnn} GNN = {n_total_params} total")
+
+    # ── VQ initialization ──
+    vq_enabled = config['gnn'].get('vq_enabled', False)
+    if vq_enabled:
+        max_codes = config['gnn'].get('vq_max_codes', 4)
+        print(f"VQ: enabled, max_codes={max_codes}/element")
+
+        # Initialize codebook from first batch
+        model.eval()
+        with torch.no_grad():
+            first_batch = next(iter(train_loader)).to(device)
+            h_init = model.env_encoder(
+                first_batch.element_indices, first_batch.edge_index, first_batch.distances)
+            model.vq.initialize_codebook(h_init, first_batch.element_indices)
+        model.vq_active = True
+
+        util = model.vq.get_codebook_utilization()
+        for elem, info in util.items():
+            if info['max_codes'] > 1:
+                print(f"  {elem}: {info['max_codes']} codes initialized")
 
     # ── Optimizer ──
     lr = config['learning_rate']
     min_lr = config['minimum_learning_rate']
-    wd = config['weight_decay']
-
     optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr, weight_decay=wd)
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr, weight_decay=config['weight_decay'])
 
     # ── Training loop ──
     patience = config['convergence_patience']
     threshold = config['convergence_threshold']
     time_limit = config['max_hours'] * 3600
 
-    best_rmse = float('inf')
-    best_state = None
-    epochs_no_improve = 0
-    rmse_history, energy_history, val_history = [], [], []
+    best_val_rmse = float('inf')
+    best_model_state = None
+    epochs_without_improvement = 0
+    train_rmse_history = []
+    val_rmse_history = []
 
     print(f"\n{'Epoch':>8} | {'Train RMSE':>10} | {'Val RMSE':>10} "
           f"| {'LR':>10} | {'Time':>8}")
     print("-" * 60)
 
-    t0 = time.time()
-    epoch = 0
+    train_start = time.time()
 
-    def _should_stop():
-        nonlocal epochs_no_improve
-        if time.time() - t0 > time_limit:
+    for epoch in range(1, 10000):
+        elapsed = time.time() - train_start
+
+        # Check time limit
+        if elapsed > time_limit:
             print(f"\nTime limit reached ({time_limit / 3600:.1f} hours)")
-            return True
-        if epochs_no_improve >= patience:
-            cur_lr = optimizer.param_groups[0]['lr']
-            if cur_lr <= min_lr * 1.01:
-                print(f"\nConverged at minimum LR ({cur_lr:.0e})")
-                return True
-            # Drop LR by 10x and keep going
-            new_lr = max(cur_lr / 10, min_lr)
+            break
+
+        # Check patience -> reduce LR or stop
+        if epochs_without_improvement >= patience:
+            current_lr = optimizer.param_groups[0]['lr']
+            if current_lr <= min_lr * 1.01:
+                print(f"\nConverged at minimum LR ({current_lr:.0e})")
+                break
+            new_lr = max(current_lr / 10, min_lr)
             for pg in optimizer.param_groups:
                 pg['lr'] = new_lr
-            print(f"\n  Patience hit, LR: {cur_lr:.0e} -> {new_lr:.0e}")
-            epochs_no_improve = 0
-        return False
+            print(f"\n  Patience hit, LR: {current_lr:.0e} -> {new_lr:.0e}")
+            epochs_without_improvement = 0
 
-    while not _should_stop():
-        epoch += 1
-        elapsed = time.time() - t0
-
-        # ── Train ──
+        # ── Train one epoch ──
         model.train()
-        rmse_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
-        energy_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
-        n_batch = 0
+        batch_rmse_total = 0.0
+        num_batches = 0
 
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            forces, energies = model(batch)
-            force_rmse = compute_core_force_rmse(
-                forces, batch.dft_forces, batch.element_indices, core_mask)
+            forces_pred, vq_loss = model(batch)
+            rmse = force_rmse(forces_pred, batch.dft_forces, batch.element_indices, core_mask)
 
-            loss = force_rmse
-            if use_energy and batch.dft_energy is not None:
-                energy_rmse = torch.sqrt(
-                    torch.mean((energies - batch.dft_energy) ** 2) + 1e-30)
-                loss = force_rmse + energy_weight * energy_rmse
-                energy_sum += energy_rmse.detach()
+            loss = rmse
+            if vq_enabled and model.vq_active:
+                loss = loss + vq_loss
 
             loss.backward()
-
-            # Freeze fixed pairs
-            if frozen_mask is not None:
-                model.apply_frozen_mask(frozen_mask)
-
+            model.apply_frozen_mask(frozen_mask)
             optimizer.step()
-            rmse_sum += force_rmse.detach()
-            n_batch += 1
 
-        train_rmse = (rmse_sum.item() / n_batch) * FORCE_AU_TO_EV_ANG
-        train_energy = (energy_sum.item() / max(n_batch, 1)) * HARTREE_TO_EV
+            batch_rmse_total += rmse.item()
+            num_batches += 1
+
+        train_rmse_ev = (batch_rmse_total / num_batches) * FORCE_AU_TO_EV_ANG
 
         # ── Validate ──
         model.eval()
-        val_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
-        n_val_batch = 0
+        val_rmse_total = 0.0
+        num_val_batches = 0
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
-                forces, _ = model(batch)
-                val_rmse = compute_core_force_rmse(
-                    forces, batch.dft_forces, batch.element_indices, core_mask)
-                val_sum += val_rmse
-                n_val_batch += 1
+                forces_pred, _ = model(batch)
+                rmse = force_rmse(forces_pred, batch.dft_forces, batch.element_indices, core_mask)
+                val_rmse_total += rmse.item()
+                num_val_batches += 1
 
-        val_rmse_ev = (val_sum.item() / max(n_val_batch, 1)) * FORCE_AU_TO_EV_ANG
+        val_rmse_ev = (val_rmse_total / num_val_batches) * FORCE_AU_TO_EV_ANG
 
-        rmse_history.append(train_rmse)
-        energy_history.append(train_energy)
-        val_history.append(val_rmse_ev)
+        train_rmse_history.append(train_rmse_ev)
+        val_rmse_history.append(val_rmse_ev)
 
-        # Best model tracking
-        if val_rmse_ev < best_rmse - threshold:
-            best_rmse = val_rmse_ev
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            epochs_no_improve = 0
+        # Track best model
+        if val_rmse_ev < best_val_rmse - threshold:
+            best_val_rmse = val_rmse_ev
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improvement = 0
         else:
-            epochs_no_improve += 1
+            epochs_without_improvement += 1
 
         # Print progress
-        cur_lr = optimizer.param_groups[0]['lr']
-        if epoch % 10 == 1 or epoch <= 5 or epochs_no_improve == 0:
-            print(f"{epoch:8d} | {train_rmse:10.6f} | {val_rmse_ev:10.6f} "
-                  f"| {cur_lr:10.2e} | {elapsed:7.1f}s")
+        current_lr = optimizer.param_groups[0]['lr']
+        if epoch <= 5 or epoch % 10 == 1 or epochs_without_improvement == 0:
+            print(f"{epoch:8d} | {train_rmse_ev:10.6f} | {val_rmse_ev:10.6f} "
+                  f"| {current_lr:10.2e} | {elapsed:7.1f}s")
 
-    timer.mark("Training")
+        # VQ monitoring every 50 epochs
+        if vq_enabled and model.vq_active and epoch % 50 == 0:
+            util = model.vq.get_codebook_utilization()
+            parts = []
+            for elem, info in util.items():
+                if info['max_codes'] > 1:
+                    parts.append(f"{elem}:{info['active']}/{info['max_codes']} "
+                                 f"(ppl={info['perplexity']:.1f})")
+            if parts:
+                print(f"  VQ [{epoch}]: {', '.join(parts)}")
 
-    # ── Restore best ──
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"\nRestored best model (val RMSE = {best_rmse:.6f} eV/A)")
+    # ── Restore best model ──
+    if best_model_state is not None:
+        vq_was_active = model.vq_active if vq_enabled else False
+        model.load_state_dict(best_model_state)
+        if vq_enabled:
+            model.vq_active = vq_was_active
+        print(f"\nRestored best model (val RMSE = {best_val_rmse:.6f} eV/A)")
 
     model.to(device)
 
-    # ── Print final parameters ──
+    # ── VQ summary ──
+    if vq_enabled and model.vq_active:
+        util = model.vq.get_codebook_utilization()
+        active_codes = model.vq.get_active_codes()
+        print(f"\nVQ CODEBOOK SUMMARY (after training)")
+        for elem, info in util.items():
+            if info['max_codes'] > 1:
+                print(f"  {elem}: {active_codes[elem]} active codes "
+                      f"(of {info['max_codes']} max), perplexity={info['perplexity']:.2f}")
+
+    # ── Print final Morse parameters ──
     params = model.get_base_params_display()
     print(f"\n{'='*60}")
     print("FINAL BASE MORSE PARAMETERS")
     if config['gnn']['enabled']:
-        print("(Note: with GNN enabled, base params are shifted by per-edge corrections.")
-        print(" Per-edge params in the LAMMPS export section show actual physical values.)")
+        print("(Note: with GNN, base params are shifted by per-edge corrections.")
+        print(" Actual values are in the LAMMPS export section.)")
     print('='*60)
     print(f"  {'Pair':>10} {'D_e(eV)':>12} {'alpha(1/A)':>12} {'r0(A)':>12}  Status")
     print(f"  {'-'*58}")
-    for i, pn in enumerate(pair_names):
-        status = "FROZEN" if pn in frozen_pair_names else "trained"
-        print(f"  {pn:>10} {params['D_e'][i]:12.6f} {params['alpha'][i]:12.6f} "
+    for i, pair_name in enumerate(pair_names):
+        status = "FROZEN" if pair_name in frozen_pairs else "trained"
+        print(f"  {pair_name:>10} {params['D_e'][i]:12.6f} {params['alpha'][i]:12.6f} "
               f"{params['r0'][i]:12.6f}  {status}")
 
     # ── Save checkpoint ──
-    ckpt_path = os.path.join(results_dir, 'checkpoint.pt')
+    checkpoint_path = os.path.join(results_dir, 'checkpoint.pt')
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'best_rmse': best_rmse,
+        'best_rmse': best_val_rmse,
         'config': config,
         'elements': elements,
         'pair_names': pair_names,
-        'rmse_history': rmse_history,
-        'val_history': val_history,
-    }, ckpt_path)
-    print(f"Saved: {ckpt_path}")
+        'train_rmse_history': train_rmse_history,
+        'val_rmse_history': val_rmse_history,
+        'vq_active': model.vq_active if vq_enabled else False,
+    }, checkpoint_path)
+    print(f"Saved: {checkpoint_path}")
 
-    # ── Generate all diagnostic plots ──
+    # ── Diagnostic plots ──
     generate_all_plots(
         model, dataset, device, config,
-        rmse_history=rmse_history,
-        energy_history=energy_history,
-        val_history=val_history,
+        train_rmse_history=train_rmse_history,
+        val_rmse_history=val_rmse_history,
         output_dir=os.path.join(results_dir, 'plots'),
     )
 
-    timer.mark("Plotting")
-
     # ── LAMMPS export ──
-    clustering_mode = config.get('lammps_export', {}).get('clustering', 'embedding')
-    n_clusters = config.get('lammps_export', {}).get('n_clusters', None)
     export_lammps(model, dataset, config,
                   output_dir=lammps_dir,
-                  clustering=clustering_mode, n_clusters=n_clusters,
-                  original_data=config.get('original_data'),
-                  write_lammps_in=False)
-    timer.mark("LAMMPS export")
+                  original_data=config.get('original_data'))
 
+    # ── Done ──
+    total_time = time.time() - start_time
     print(f"\n{'='*60}")
-    print(f"Done! Total time: {time.time() - t0:.1f}s")
-    print(f"Best val RMSE: {best_rmse:.6f} eV/A")
+    print(f"Done! Total time: {total_time:.1f}s")
+    print(f"Best val RMSE: {best_val_rmse:.6f} eV/A")
     print(f"Results: {results_dir}")
     print(f"LAMMPS files: {lammps_dir}")
     print('='*60)
 
-    timer.summary()
-
+    # Cleanup logging
     log_handler.close()
     logging.getLogger().removeHandler(log_handler)
     sys.stdout = sys.stdout.stream if hasattr(sys.stdout, 'stream') else sys.stdout
     sys.stderr = sys.stderr.stream if hasattr(sys.stderr, 'stream') else sys.stderr
     print(f"Full log saved to: {log_path}")
 
-    # ── Optional analysis ──
+    # Optional post-training analysis
     if args.analyze:
         lammps_bin = args.lammps_bin or os.environ.get('LAMMPS_BIN', 'lmp')
         from .run_analysis import main_from_fitter
         main_from_fitter(
-            run_dir=output_base,
+            run_dir=output_dir,
             config_path=os.path.abspath(args.config),
             lammps_bin=lammps_bin,
             infante=args.infante,
