@@ -297,6 +297,14 @@ def parse_cluster_potentials(filepath):
     cluster_params = {}
     lj_params = {}
 
+    # Detect pair_style from file to know format
+    is_hybrid = False
+    with open(filepath) as f:
+        for line in f:
+            if line.strip().startswith('pair_style') and 'hybrid' in line:
+                is_hybrid = True
+                break
+
     with open(filepath) as f:
         for line in f:
             stripped = line.strip()
@@ -314,31 +322,35 @@ def parse_cluster_potentials(filepath):
                 continue
 
             try:
-                style = parts[3]
-                if style == 'morse' and len(parts) >= 8:
-                    D_e = float(parts[4])
-                    alpha = float(parts[5])
-                    r0 = float(parts[6])
-                    is_fallback = '[fallback]' in comment.lower()
-
-                    # Get base pair from comment (e.g. "Cd_0-Se_2" -> "Cd-Se")
-                    cluster_name = comment.split()[0] if comment else ''
-                    if '-' in cluster_name:
-                        ce1, ce2 = cluster_name.split('-')
-                        b1 = base_element(ce1)
-                        b2 = base_element(ce2)
-                        bp = f"{b1}-{b2}"
-                        cluster_params.setdefault(bp, []).append(
-                            (cluster_name, D_e, alpha, r0, is_fallback))
-
-                elif style == 'lj/cut' and len(parts) >= 6:
-                    eps = float(parts[4])
-                    sigma = float(parts[5])
-                    # Get base pair from comment
-                    if comment:
-                        pair_name = comment.split('(')[0].strip()
-                        if '-' in pair_name:
-                            lj_params[pair_name] = (eps, sigma)
+                if is_hybrid:
+                    # hybrid format: pair_coeff T1 T2 morse D_e alpha r0 cut
+                    style = parts[3]
+                    if style == 'morse' and len(parts) >= 8:
+                        D_e, alpha, r0 = float(parts[4]), float(parts[5]), float(parts[6])
+                        is_fallback = '[fallback]' in comment.lower()
+                        cluster_name = comment.split()[0] if comment else ''
+                        if '-' in cluster_name:
+                            ce1, ce2 = cluster_name.split('-')
+                            bp = '-'.join(sorted([base_element(ce1), base_element(ce2)]))
+                            cluster_params.setdefault(bp, []).append(
+                                (cluster_name, D_e, alpha, r0, is_fallback))
+                    elif style == 'lj/cut' and len(parts) >= 6:
+                        eps, sigma = float(parts[4]), float(parts[5])
+                        if comment:
+                            pair_name = comment.split('(')[0].strip()
+                            if '-' in pair_name:
+                                lj_params[pair_name] = (eps, sigma)
+                else:
+                    # direct morse format: pair_coeff T1 T2 D_e alpha r0 cut
+                    if len(parts) >= 7:
+                        D_e, alpha, r0 = float(parts[3]), float(parts[4]), float(parts[5])
+                        is_fallback = '[fallback]' in comment.lower()
+                        cluster_name = comment.split()[0] if comment else ''
+                        if '-' in cluster_name:
+                            ce1, ce2 = cluster_name.split('-')
+                            bp = '-'.join(sorted([base_element(ce1), base_element(ce2)]))
+                            cluster_params.setdefault(bp, []).append(
+                                (cluster_name, D_e, alpha, r0, is_fallback))
             except (ValueError, IndexError):
                 continue
 
@@ -537,7 +549,7 @@ def plot_potentials(cluster_params, output_file):
     Each cluster sub-type gets its own curve; fallbacks are dimmed.
     """
     print("  Generating potential curves (sub-types + Infante)...")
-    base_pairs = ['Cd-Se', 'Cd-Cd', 'Se-Se', 'Cd-O', 'Se-O']
+    base_pairs = ['Cd-Se', 'Cd-Cd', 'Se-Se', 'Cd-O', 'O-Se']
 
     # Only show pairs that have data
     active_pairs = []
@@ -970,11 +982,17 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
             r, theta = analyze_structure(dft_frames)
             struct_data['DFT'] = {'r': r, 'theta': theta}
 
+    # Truncate MD trajectories to DFT length for fair comparison
+    n_dft = len(dft_frames)
+
     # Infante
     infante_frames = []
     if infante_xyz and os.path.exists(infante_xyz):
         print(f"\n  Loading Infante trajectory...")
         infante_frames = parse_xyz_frames(infante_xyz, skip_frames=SKIP_FRAMES)
+        if n_dft > 0 and len(infante_frames) > n_dft:
+            print(f"    Truncating {len(infante_frames)} -> {n_dft} frames (matching DFT)")
+            infante_frames = infante_frames[:n_dft]
         print(f"    Frames: {len(infante_frames)}")
         if infante_frames:
             rdf_data['Infante'] = {}
@@ -991,6 +1009,9 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
     # GNN-Morse
     print(f"\n  Loading GNN-Morse trajectory...")
     md_frames = parse_xyz_frames(md_xyz, skip_frames=SKIP_FRAMES)
+    if n_dft > 0 and len(md_frames) > n_dft:
+        print(f"    Truncating {len(md_frames)} -> {n_dft} frames (matching DFT)")
+        md_frames = md_frames[:n_dft]
     print(f"    Frames: {len(md_frames)}")
     if md_frames:
         rdf_data['GNN-Morse'] = {}
@@ -1012,8 +1033,10 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
     if log_data:
         plot_energy_stability(log_data, os.path.join(results_dir, 'energy_stability.png'))
 
-    # Potential curves (cluster sub-types from potentials.txt)
+    # Potential curves (cluster sub-types from potentials.txt or gnn_morse.in)
     potentials_file = os.path.join(lammps_dir, 'potentials.txt')
+    if not os.path.exists(potentials_file):
+        potentials_file = os.path.join(lammps_dir, 'gnn_morse.in')
     cluster_params, _ = parse_cluster_potentials(potentials_file)
     if cluster_params:
         plot_potentials(cluster_params, os.path.join(results_dir, 'potentials.png'))
