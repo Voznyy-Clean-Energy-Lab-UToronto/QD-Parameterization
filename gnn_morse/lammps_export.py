@@ -1,7 +1,6 @@
 import os
 import numpy as np
 from datetime import datetime
-from sklearn.mixture import GaussianMixture
 
 from .utils import (
     HARTREE_TO_EV, BOHR_TO_ANGSTROM, canonical_pair, base_element, MASSES,
@@ -9,293 +8,84 @@ from .utils import (
 )
 
 
-def classify_atoms_embedding(embeddings_multi, atom_symbols, inorganic_elements,
-                             n_clusters_per_element=None, max_clusters=8):
-    symbols = np.array(atom_symbols)
+def _describe_vq_types(atom_types, symbols, edge_index_np, inorganic_elements):
+    from collections import Counter
+
     inorganic_set = set(inorganic_elements)
-
-    if embeddings_multi.ndim == 3:
-        avg_emb = np.mean(embeddings_multi, axis=0)
-    else:
-        avg_emb = embeddings_multi
-
-    atom_types = list(atom_symbols)
-    type_legend = {}
-
-    for elem in sorted(inorganic_set):
-        mask = symbols == elem
-        indices = np.where(mask)[0]
-        if len(indices) == 0:
-            continue
-
-        elem_emb = avg_emb[indices]
-
-        if n_clusters_per_element and elem in n_clusters_per_element:
-            n_c = n_clusters_per_element[elem]
-        else:
-            n_c = _select_n_clusters_bic(elem_emb, max_clusters)
-
-        if n_c <= 1 or len(indices) <= n_c:
-            type_name = f"{elem}_0"
-            type_legend[type_name] = {
-                'count': len(indices),
-                'description': f"{elem}, single cluster ({len(indices)} atoms)",
-            }
-            for idx in indices:
-                atom_types[idx] = type_name
-            continue
-
-        gmm = GaussianMixture(n_components=n_c, covariance_type='full',
-                               n_init=5, random_state=42)
-        labels = gmm.fit_predict(elem_emb)
-
-        unique_labels, counts = np.unique(labels, return_counts=True)
-        order = np.argsort(-counts)
-
-        label_to_name = {}
-        for rank, orig_label in enumerate(order):
-            type_name = f"{elem}_{rank}"
-            count = counts[orig_label]
-            label_to_name[orig_label] = type_name
-            type_legend[type_name] = {
-                'count': int(count),
-                'description': f"{elem}, embedding cluster {rank} ({count} atoms)",
-            }
-
-        for local_i, global_i in enumerate(indices):
-            atom_types[global_i] = label_to_name[labels[local_i]]
-
-    return atom_types, type_legend
-
-
-def _select_n_clusters_bic(X, max_k):
-    n = len(X)
-    if n <= 2:
-        return 1
-    best_k, best_bic = 1, np.inf
-    for k in range(1, min(max_k + 1, n)):
-        try:
-            gmm = GaussianMixture(n_components=k, covariance_type='full',
-                                   n_init=3, random_state=42)
-            gmm.fit(X)
-            bic = gmm.bic(X)
-            if bic < best_bic:
-                best_bic = bic
-                best_k = k
-        except Exception:
-            break
-    return best_k
-
-
-def compute_discretization_error(edge_index, atom_types, per_edge_params,
-                                 pair_indices, pair_names, frozen_pairs, graph):
-    frozen_set = set(frozen_pairs)
-    edge_src = edge_index[0]
-    n_atoms = len(atom_types)
-
-    keep_mask = np.array([pair_names[pi] not in frozen_set for pi in pair_indices])
-    src_types = np.array([atom_types[i] for i in edge_src])
-    tgt_types = np.array([atom_types[i] for i in edge_index[1]])
-    cp_names = np.array([canonical_pair(s, t) for s, t in zip(src_types, tgt_types)])
-
-    cp_medians = {}
-    for cp in np.unique(cp_names[keep_mask]):
-        mask = (cp_names == cp) & keep_mask
-        cp_medians[cp] = {
-            'D_e': float(np.median(per_edge_params['D_e'][mask])),
-            'alpha': float(np.median(per_edge_params['alpha'][mask])),
-            'r0': float(np.median(per_edge_params['r0'][mask])),
-        }
-
-    D_e_disc = np.copy(per_edge_params['D_e'])
-    alpha_disc = np.copy(per_edge_params['alpha'])
-    r0_disc = np.copy(per_edge_params['r0'])
-
-    for i in range(len(edge_src)):
-        cp = cp_names[i]
-        if cp in cp_medians:
-            D_e_disc[i] = cp_medians[cp]['D_e']
-            alpha_disc[i] = cp_medians[cp]['alpha']
-            r0_disc[i] = cp_medians[cp]['r0']
-        elif not keep_mask[i]:
-            pass
-        else:
-            D_e_disc[i] = 0.001
-
-    distances_au = graph.distances.numpy()
-    unit_vecs = graph.edge_unit_vectors.numpy()
-    symbols = [atom_types[i].partition('_')[0] if '_' in atom_types[i] else atom_types[i]
-               for i in range(n_atoms)]
-    inorganic_mask = np.array([s not in ('C', 'H', 'O') for s in symbols])
-
-    def _compute_forces(D_e_ev, alpha_invang, r0_ang):
-        D_e_au = D_e_ev / HARTREE_TO_EV
-        alpha_au = alpha_invang * BOHR_TO_ANGSTROM
-        r0_au = r0_ang / BOHR_TO_ANGSTROM
-        x = distances_au - r0_au
-        exp1 = np.exp(-alpha_au * x)
-        sf = 2.0 * D_e_au * alpha_au * (exp1**2 - exp1)
-        fvecs = -sf[:, None] * unit_vecs
-        forces = np.zeros((n_atoms, 3))
-        np.add.at(forces, edge_src, fvecs)
-        return forces * (HARTREE_TO_EV / BOHR_TO_ANGSTROM)
-
-    cont_forces = _compute_forces(per_edge_params['D_e'],
-                                  per_edge_params['alpha'],
-                                  per_edge_params['r0'])
-    disc_forces = _compute_forces(D_e_disc, alpha_disc, r0_disc)
-    dft_evang = graph.dft_forces.numpy() * (HARTREE_TO_EV / BOHR_TO_ANGSTROM)
-
-    cont_rmse = np.sqrt(np.mean((cont_forces[inorganic_mask] - dft_evang[inorganic_mask])**2))
-    disc_rmse = np.sqrt(np.mean((disc_forces[inorganic_mask] - dft_evang[inorganic_mask])**2))
-
-    return cont_rmse, disc_rmse
-
-
-def _collect_embeddings(model_cpu, dataset, n_frames_emb=50):
-    n_use = min(n_frames_emb, len(dataset.graphs))
-    all_emb = []
-    for fi in range(n_use):
-        emb = model_cpu.get_embeddings(dataset.graphs[fi])
-        if emb is not None:
-            all_emb.append(emb)
-    return np.stack(all_emb), n_use
-
-
-def _distribute_k(total_k, elem_counts):
-    total_inorg = sum(elem_counts.values())
-    n_per_elem = {}
-    for elem in sorted(elem_counts.keys()):
-        frac = elem_counts[elem] / total_inorg
-        n_per_elem[elem] = max(1, round(total_k * frac))
-    while sum(n_per_elem.values()) > total_k:
-        biggest = max(n_per_elem, key=n_per_elem.get)
-        if n_per_elem[biggest] > 1:
-            n_per_elem[biggest] -= 1
-    while sum(n_per_elem.values()) < total_k:
-        smallest = min(n_per_elem, key=n_per_elem.get)
-        n_per_elem[smallest] += 1
-    return n_per_elem
-
-
-def _evaluate_clustering(atom_types, edge_index_np, per_edge_params,
-                         pair_indices, pair_names, frozen_pairs, graph, symbols):
-    cp_data = _build_cluster_pair_edges(
-        edge_index_np, atom_types, per_edge_params,
-        pair_indices, pair_names, frozen_pairs,
-        edge_distances_angstrom=graph.distances.numpy() * BOHR_TO_ANGSTROM)
-    n_fallback = sum(1 for d in cp_data.values() if d.get('is_fallback'))
-    n_pairs = len(cp_data)
-    _, disc_rmse = compute_discretization_error(
-        edge_index_np, atom_types, per_edge_params,
-        pair_indices, pair_names, frozen_pairs, graph)
-    n_inorg_types = sum(1 for t in set(atom_types) if t not in set(symbols))
-    return disc_rmse, n_pairs, n_fallback, n_inorg_types
-
-
-def auto_select_k(avg_emb, symbols, inorganic, edge_index_np, per_edge_params,
-                  pair_indices, pair_names, frozen_pairs, graph,
-                  max_k=12, verbose=True):
-    sym_arr = np.array(symbols)
-    inorganic_set = set(inorganic)
-    elem_counts = {e: int(np.sum(sym_arr == e)) for e in inorganic}
-
-    if verbose:
-        print(f"\n  Auto-selecting cluster count (k=2..{max_k})...")
-
-    best_k = 2
-    best_rmse = np.inf
-    best_types = None
-    best_legend = None
-
-    for total_k in range(2, max_k + 1):
-        n_per_elem = _distribute_k(total_k, elem_counts)
-        atom_types, type_legend = classify_atoms_embedding(
-            avg_emb, symbols, inorganic_set,
-            n_clusters_per_element=n_per_elem)
-        disc_rmse, n_pairs, n_fallback, n_inorg = _evaluate_clustering(
-            atom_types, edge_index_np, per_edge_params,
-            pair_indices, pair_names, frozen_pairs, graph, symbols)
-
-        if verbose:
-            print(f"  k={total_k:>2}: RMSE={disc_rmse:.4f}, {n_pairs} pairs ({n_fallback} fallback)")
-
-        if disc_rmse < best_rmse:
-            best_rmse = disc_rmse
-            best_k = total_k
-            best_types = atom_types
-            best_legend = type_legend
-
-    if verbose:
-        print(f"  -> Best: k={best_k} (RMSE={best_rmse:.4f})")
-
-    return best_k, best_types, best_legend
-
-
-def classify_atoms(edge_index, atom_symbols, inorganic_elements):
-    symbols = np.array(atom_symbols)
-    inorganic_set = set(inorganic_elements)
-    inorganic_sorted = sorted(inorganic_set)
-
-    is_inorganic = np.array([s in inorganic_set for s in symbols])
-    src, tgt = edge_index[0], edge_index[1]
     n_atoms = len(symbols)
+    src, tgt = edge_index_np[0], edge_index_np[1]
 
-    neighbor_counts = [{} for _ in range(n_atoms)]
-    has_organic_neighbor = np.zeros(n_atoms, dtype=bool)
+    # Per-atom neighbor analysis
+    cross_coord = np.zeros(n_atoms, dtype=int)       # different-element inorganic neighbors
+    total_inorg_coord = np.zeros(n_atoms, dtype=int)  # all inorganic neighbors
+    cross_neighbor_elem = [Counter() for _ in range(n_atoms)]
+    has_ligand = np.zeros(n_atoms, dtype=bool)
 
     for s, t in zip(src, tgt):
-        tgt_sym = symbols[t]
-        if tgt_sym in inorganic_set:
-            neighbor_counts[s][tgt_sym] = neighbor_counts[s].get(tgt_sym, 0) + 1
-        elif is_inorganic[s]:
-            has_organic_neighbor[s] = True
+        src_elem = symbols[s]
+        tgt_elem = symbols[t]
+        if src_elem in inorganic_set:
+            if tgt_elem in inorganic_set:
+                total_inorg_coord[s] += 1
+                if tgt_elem != src_elem:
+                    cross_coord[s] += 1
+                    cross_neighbor_elem[s][tgt_elem] += 1
+            else:
+                has_ligand[s] = True
 
-    sig_to_atoms = {}
-    for i in range(n_atoms):
-        if not is_inorganic[i]:
+    # Per-element max cross-species coord (core = atoms matching this max)
+    elem_max_cross = {}
+    for elem in inorganic_set:
+        indices = [i for i, s in enumerate(symbols) if s == elem]
+        if indices:
+            elem_max_cross[elem] = int(np.max(cross_coord[indices]))
+
+    unique_types = sorted(set(atom_types))
+    label_map = {}
+
+    for tname in unique_types:
+        elem = tname.partition('_')[0]
+
+        # Non-inorganic: C_0 -> C, H_0 -> H, but O with multiple types -> O_0, O_1
+        if elem not in inorganic_set:
+            elem_types = [t for t in unique_types if t.partition('_')[0] == elem]
+            if len(elem_types) == 1:
+                label_map[tname] = elem
+            else:
+                label_map[tname] = tname
             continue
-        elem = symbols[i]
-        parts = []
-        for nb_elem in inorganic_sorted:
-            if nb_elem == elem:
-                continue
-            count = neighbor_counts[i].get(nb_elem, 0)
-            if count > 0:
-                parts.append(f"{count}{nb_elem}")
-        inorg_sig = '_'.join(parts) if parts else 'isolated'
-        key = (elem, inorg_sig, bool(has_organic_neighbor[i]))
-        sig_to_atoms.setdefault(key, []).append(i)
 
-    base_groups = {}
-    for (elem, inorg_sig, has_lig), atoms in sig_to_atoms.items():
-        base_groups.setdefault((elem, inorg_sig), {})[has_lig] = atoms
+        indices = [i for i, t in enumerate(atom_types) if t == tname]
+        median_cross = int(np.round(np.median(cross_coord[indices])))
+        median_total = int(np.round(np.median(total_inorg_coord[indices])))
+        frac_ligand = float(np.mean(has_ligand[indices]))
+        max_cross = elem_max_cross.get(elem, 4)
 
-    atom_types = list(atom_symbols)
-    type_legend = {}
+        # Core = matches max cross-species coordination, surface = lower
+        location = "core" if median_cross >= max_cross else "surf"
 
-    for (elem, inorg_sig), lig_groups in sorted(base_groups.items()):
-        needs_lig_suffix = len(lig_groups) > 1
+        # Primary cross-species neighbor element
+        all_neighbors = Counter()
+        for i in indices:
+            all_neighbors.update(cross_neighbor_elem[i])
+        primary_neighbor = all_neighbors.most_common(1)[0][0] if all_neighbors else ""
 
-        for has_lig, atom_indices in sorted(lig_groups.items()):
-            type_name = f"{elem}_{inorg_sig}"
-            if needs_lig_suffix and has_lig:
-                type_name += "_lig"
+        coord_tag = f"_{median_cross}{primary_neighbor}" if primary_neighbor else ""
+        lig_tag = "_lig" if frac_ligand >= 0.5 else ""
+        label_map[tname] = f"{elem}_{location}{coord_tag}{lig_tag}"
 
-            desc = f"{elem}, {inorg_sig} inorganic coord"
-            if needs_lig_suffix:
-                desc += ", has ligand nbrs" if has_lig else ", no ligand nbrs"
-            elif has_lig:
-                desc += ", has ligand nbrs"
+    # Resolve duplicates: append _a, _b, _c letter suffixes
+    label_values = list(label_map.values())
+    counts = Counter(label_values)
+    if any(c > 1 for c in counts.values()):
+        seen = Counter()
+        for tname in unique_types:
+            label = label_map[tname]
+            if counts[label] > 1:
+                seen[label] += 1
+                label_map[tname] = f"{label}_{chr(96 + seen[label])}"
 
-            type_legend[type_name] = {
-                'count': len(atom_indices),
-                'description': desc,
-            }
-            for idx in atom_indices:
-                atom_types[idx] = type_name
-
-    return atom_types, type_legend
+    return label_map
 
 
 def _build_cluster_pair_edges(edge_index, atom_types, per_edge_params,
@@ -522,7 +312,6 @@ def _to_gen_params(cluster_pair_data):
 
 
 def export_lammps(model, dataset, config, output_dir,
-                  clustering='embedding', n_clusters=None, n_frames_emb=50,
                   original_data=None, temp=300, write_lammps_in=True):
     import torch
 
@@ -537,39 +326,41 @@ def export_lammps(model, dataset, config, output_dir,
     per_edge_params = model_cpu.get_per_edge_params(graph)
     symbols = dataset.frame_data[0][0]
     inorganic = sorted(set(config.get('knn_edges', {}).get('inorganic_elements', ['Cd', 'Se'])))
-    inorganic_set = set(inorganic)
     edge_index_np = graph.edge_index.numpy()
 
     # ── Atom classification ──
-    if clustering == 'embedding':
-        embeddings_multi, n_use = _collect_embeddings(model_cpu, dataset, n_frames_emb)
-        avg_emb = np.mean(embeddings_multi, axis=0)
-        print(f"\nCollected embeddings from {n_use} frames (shape: {avg_emb.shape})")
+    vq_result = model_cpu.get_atom_types(graph)
 
-        if n_clusters is None:
-            frozen_pairs = set(config.get('fixed_pairs', {}).keys())
-            pair_indices = graph.pair_indices.numpy()
-            best_k, atom_types, type_legend = auto_select_k(
-                avg_emb, symbols, inorganic, edge_index_np, per_edge_params,
-                pair_indices, dataset.pair_names, frozen_pairs, graph,
-                max_k=12, verbose=True)
-            print(f"\nAtom classification (embedding-based GMM, auto k={best_k}):")
-        else:
-            n_clusters_per_elem = None
-            if isinstance(n_clusters, dict):
-                n_clusters_per_elem = n_clusters
-            elif isinstance(n_clusters, int):
-                sym_arr = np.array(symbols)
-                elem_counts = {e: int(np.sum(sym_arr == e)) for e in inorganic}
-                n_clusters_per_elem = _distribute_k(n_clusters, elem_counts)
-            atom_types, type_legend = classify_atoms_embedding(
-                embeddings_multi, symbols, inorganic_set,
-                n_clusters_per_element=n_clusters_per_elem)
-            print(f"\nAtom classification (embedding-based GMM, k={n_clusters}):")
+    if vq_result is not None:
+        # VQ path: atom types from trained codebook, relabeled by coordination
+        vq_indices, atom_types = vq_result
+
+        # Rename VQ codes to descriptive labels (e.g. Cd_0 -> Cd_core_4Se)
+        label_map = _describe_vq_types(atom_types, symbols, edge_index_np, inorganic)
+        atom_types = [label_map[t] for t in atom_types]
+
+        type_legend = {}
+        for old_name, new_name in sorted(set(label_map.items())):
+            count = sum(1 for t in atom_types if t == new_name)
+            elem = old_name.partition('_')[0]
+            type_legend[new_name] = {
+                'count': count,
+                'description': f"{elem}, {new_name} ({count} atoms)",
+            }
+
+        active_codes = model_cpu.vq.get_active_codes()
+        active_str = ', '.join(f"{e}={n}" for e, n in active_codes.items()
+                               if model_cpu.vq.n_codes_per_elem[e] > 1)
+        print(f"\nAtom classification (VQ codebook, active codes: {active_str}):")
+
     else:
-        atom_types, type_legend = classify_atoms(
-            edge_index_np, symbols, inorganic_set)
-        print(f"\nAtom classification (coordination-based):")
+        # No VQ: each element is one atom type (no subtypes)
+        atom_types = list(symbols)
+        type_legend = {}
+        for elem in sorted(set(symbols)):
+            count = sum(1 for s in symbols if s == elem)
+            type_legend[elem] = {'count': count, 'description': f"{elem} ({count} atoms)"}
+        print(f"\nAtom classification (element-based, no subtypes):")
 
     # Print type legend
     max_name = max(len(t) for t in type_legend) if type_legend else 10
@@ -633,7 +424,7 @@ def export_lammps(model, dataset, config, output_dir,
 
     # Diagnose fallback pairs
     if n_fallback > 0:
-        print(f"\n  ── Fallback Diagnosis ({n_fallback} pairs) ──")
+        print(f"\n  -- Fallback Diagnosis ({n_fallback} pairs) --")
         organic_bases = {'C', 'H', 'O'}
         expected, surprising = [], []
         for cp_name, d in sorted(cluster_pair_data.items()):
@@ -658,7 +449,7 @@ def export_lammps(model, dataset, config, output_dir,
     # ── Write output files ──
     os.makedirs(output_dir, exist_ok=True)
 
-    # Atom type mapping (always needed for .data remapping)
+    # Atom type mapping
     mapping_path = os.path.join(output_dir, 'atom_type_mapping.txt')
     with open(mapping_path, 'w') as f:
         f.write(f"# Atom type mapping\n")
