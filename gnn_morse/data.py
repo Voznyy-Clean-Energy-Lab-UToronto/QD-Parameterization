@@ -7,11 +7,10 @@ from scipy.spatial.distance import cdist
 from torch_geometric.data import Data
 
 from .utils import (
-    ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROM, EV_TO_HARTREE, FORCE_AU_TO_EV_ANG,
+    ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROM, FORCE_AU_TO_EV_ANG,
     canonical_pair,
 )
 
-# ── Data readers ─────────────────────────────────────────────────────
 
 def read_extxyz(filepath, first_n=None):
     frames = ase.io.read(filepath, index=':', format='extxyz')
@@ -22,17 +21,15 @@ def read_extxyz(filepath, first_n=None):
         frames = frames[:first_n]
         print(f"  Using first {first_n} frames")
 
-    positions, forces, energies = [], [], []
+    positions, forces = [], []
     for frame in frames:
         positions.append(frame.positions * ANGSTROM_TO_BOHR)
         try:
-            ff = frame.get_forces()
-            forces.append(ff / FORCE_AU_TO_EV_ANG)
+            forces.append(frame.get_forces() / FORCE_AU_TO_EV_ANG)
         except Exception:
             forces.append(None)
-        energies.append(float(frame.info['energy']) if 'energy' in frame.info else None)
 
-    return symbols, positions, forces, energies
+    return symbols, positions, forces
 
 
 def read_lammps_dump(filepath, first_n=None):
@@ -94,11 +91,9 @@ def read_lammps_dump(filepath, first_n=None):
         forces_list = forces_list[:first_n]
         print(f"  Using first {first_n} frames")
 
-    energies = [None] * len(positions_list)
-    return atom_symbols, positions_list, forces_list, energies
+    return atom_symbols, positions_list, forces_list
 
 
-# ── Gap detection ────────────────────────────────────────────────────
 
 def detect_gap_cutoff(dist_matrix, max_neighbors=20):
     dists = dist_matrix.copy()
@@ -125,7 +120,6 @@ def detect_gap_cutoff(dist_matrix, max_neighbors=20):
     return median, cutoffs
 
 
-# ── KNN edge builder ────────────────────────────────────────────────
 
 def build_knn_edges(positions_bohr, atom_symbols, knn_config):
     inorganic = set(knn_config['inorganic_elements'])
@@ -215,14 +209,12 @@ def build_knn_edges(positions_bohr, atom_symbols, knn_config):
     return src, tgt, gap_cuts_angstrom
 
 
-# ── Dataset ──────────────────────────────────────────────────────────
 
 class DFTDataset:
 
     def __init__(self, dataset_configs, knn_config, first_n_frames=None):
         self.frame_data = []      # [(symbols, pos_bohr), ...]
         self.forces_data = []     # [forces_au or None, ...]
-        self.energies_data = []   # [energy_ev or None, ...]
         all_elements = set()
 
         print(f"\n{'='*60}")
@@ -236,16 +228,15 @@ class DFTDataset:
             print(f"\n{name} (format: {fmt})")
 
             if fmt == 'lammps':
-                symbols, pos_list, frc_list, eng_list = read_lammps_dump(
+                symbols, pos_list, frc_list = read_lammps_dump(
                     ds['xyz'], first_n=ds_first_n)
             else:
-                symbols, pos_list, frc_list, eng_list = read_extxyz(
+                symbols, pos_list, frc_list = read_extxyz(
                     ds['xyz'], first_n=ds_first_n)
 
             all_elements.update(symbols)
             self.frame_data.extend([(symbols, p) for p in pos_list])
             self.forces_data.extend(frc_list)
-            self.energies_data.extend(eng_list)
 
         self.elements = sorted(all_elements)
         self.element_to_index = {e: i for i, e in enumerate(self.elements)}
@@ -267,21 +258,7 @@ class DFTDataset:
                 self.pair_lookup[i, j] = self.pair_name_to_index[
                     f"{self.elements[lo]}-{self.elements[hi]}"]
 
-        # Process energies (relative, in Hartree)
-        valid_e = [e for e in self.energies_data if e is not None]
-        if valid_e:
-            self.mean_energy_ev = float(np.mean(valid_e))
-            self.energies_au = [
-                (e - self.mean_energy_ev) * EV_TO_HARTREE if e is not None else None
-                for e in self.energies_data
-            ]
-            print(f"\nEnergies: {len(valid_e)} valid, mean = {self.mean_energy_ev:.4f} eV")
-        else:
-            self.mean_energy_ev = 0.0
-            self.energies_au = [None] * len(self.energies_data)
-            print("\nNo energies in dataset")
-
-        print(f"Total: {len(self.frame_data)} frames, Elements: {self.elements}")
+        print(f"\nTotal: {len(self.frame_data)} frames, Elements: {self.elements}")
         print(f"Pairs ({len(self.pair_names)}): {', '.join(self.pair_names)}")
 
     def build_graphs(self):
@@ -325,10 +302,6 @@ class DFTDataset:
             frc = self.forces_data[i]
             dft_forces = torch.tensor(frc, dtype=torch.float64) if frc is not None else torch.zeros_like(pos)
 
-            # DFT energy
-            eng = self.energies_au[i]
-            dft_energy = torch.tensor([eng], dtype=torch.float64) if eng is not None else None
-
             self.graphs.append(Data(
                 pos=pos,
                 edge_index=torch.stack([src_t, tgt_t]),
@@ -337,7 +310,6 @@ class DFTDataset:
                 element_indices=elem_idx,
                 pair_indices=pair_indices,
                 dft_forces=dft_forces,
-                dft_energy=dft_energy,
             ))
 
         print(f"done ({len(self.graphs)} graphs)")
