@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from ase.units import Hartree, Bohr
 
-# ── Unit conversions ─────────────────────────────────────────────────
+# Unit conversions
 HARTREE_TO_EV = Hartree          # 27.2114 eV/Ha
 BOHR_TO_ANGSTROM = Bohr          # 0.529177 Ang/Bohr
 EV_TO_HARTREE = 1.0 / Hartree
@@ -26,7 +26,6 @@ def base_element(cluster_type):
     return cluster_type.partition('_')[0]
 
 
-# ── Shared constants ────────────────────────────────────────────────
 MASSES = {'C': 12.011, 'Cd': 112.411, 'H': 1.008, 'O': 15.999, 'Se': 78.971}
 
 FROZEN_LJ = {
@@ -52,7 +51,6 @@ BASE_PAIR_CUTOFFS = {
 }
 
 
-# ── LAMMPS .data file utilities ──────────────────────────────────────
 
 def detect_atom_style(filepath):
     with open(filepath) as f:
