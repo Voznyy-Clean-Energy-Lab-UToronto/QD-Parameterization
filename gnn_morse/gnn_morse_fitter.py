@@ -2,7 +2,6 @@
 import os
 import sys
 import time
-import logging
 
 import numpy as np
 import yaml
@@ -20,32 +19,27 @@ from .lammps_export import export_lammps
 from .plotting import generate_all_plots
 
 
-# ── Logging (tee to both console and file) ───────────────────────────
 
-class _TeeStream:
-    def __init__(self, stream, handler):
+class _TeeWriter:
+    def __init__(self, stream, log_file):
         self.stream = stream
-        self.handler = handler
+        self.log_file = log_file
     def write(self, data):
         self.stream.write(data)
         if data:
-            self.handler.stream.write(data)
-            self.handler.stream.flush()
+            self.log_file.write(data)
+            self.log_file.flush()
     def flush(self):
         self.stream.flush()
 
 
 def _setup_logging(log_path):
-    handler = logging.FileHandler(log_path, mode='w')
-    handler.setFormatter(logging.Formatter('%(message)s'))
-    logging.getLogger().setLevel(logging.INFO)
-    logging.getLogger().addHandler(handler)
-    sys.stdout = _TeeStream(sys.stdout, handler)
-    sys.stderr = _TeeStream(sys.stderr, handler)
-    return handler
+    log_file = open(log_path, 'w')
+    sys.stdout = _TeeWriter(sys.stdout, log_file)
+    sys.stderr = _TeeWriter(sys.stderr, log_file)
+    return log_file
 
 
-# ── Config ───────────────────────────────────────────────────────────
 
 def load_config(filepath):
     with open(filepath) as f:
@@ -86,7 +80,7 @@ def load_config(filepath):
 
     # Ensure numeric types (PyYAML reads 1e-3 as string sometimes)
     for key in ('learning_rate', 'minimum_learning_rate', 'convergence_threshold',
-                'validation_split', 'weight_decay', 'max_hours', 'box_size_angstrom'):
+                'validation_split', 'weight_decay', 'box_size_angstrom'):
         if key in config:
             config[key] = float(config[key])
 
@@ -100,7 +94,6 @@ def load_config(filepath):
     return config
 
 
-# ── RDF peak detection (for smart r0 + D_e initialization) ──────────
 
 def compute_rdf_peaks(pair_names, xyz_files, box_size):
     try:
@@ -149,7 +142,6 @@ def compute_rdf_peaks(pair_names, xyz_files, box_size):
     return peaks
 
 
-# ── Force RMSE (core atoms only when mask is provided) ───────────────
 
 def force_rmse(predicted, reference, element_indices, core_mask):
     squared_error = (predicted - reference) ** 2
@@ -159,7 +151,6 @@ def force_rmse(predicted, reference, element_indices, core_mask):
     return torch.sqrt(squared_error.mean() + 1e-30)
 
 
-# ── Main ─────────────────────────────────────────────────────────────
 
 def main():
     import argparse
@@ -191,7 +182,7 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
 
     log_path = os.path.join(results_dir, 'training.log')
-    log_handler = _setup_logging(log_path)
+    log_file = _setup_logging(log_path)
     print(f"Logging output to: {log_path}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -201,7 +192,7 @@ def main():
           f"max_gap_neighbors={config['knn_edges']['max_gap_neighbors']}, "
           f"ligand_cutoff={config['knn_edges'].get('ligand_cutoff', 'N/A')} A")
 
-    # ── Load data ──
+    # Load data
     dataset = DFTDataset(
         config['datasets'],
         knn_config=config['knn_edges'],
@@ -217,7 +208,7 @@ def main():
     print(f"\nElements ({num_elements}): {elements}")
     print(f"Pairs ({num_pairs}): {pair_names}")
 
-    # ── Initialize Morse parameters ──
+    # Initialize Morse parameters
     init_D_e = np.full(num_pairs, 0.1 * EV_TO_HARTREE)
     init_alpha = np.full(num_pairs, 1.5 * BOHR_TO_ANGSTROM)
     init_r0 = np.full(num_pairs, 3.0 * ANGSTROM_TO_BOHR)
@@ -260,13 +251,13 @@ def main():
                 if g_peak > 1.0:
                     init_D_e[idx] = kT_eV * np.log(g_peak) * EV_TO_HARTREE
 
-    # ── Build graphs ──
+    # Build graphs
     dataset.build_graphs()
     if not dataset.graphs:
         print("ERROR: No graphs built!")
         sys.exit(1)
 
-    # ── Train/val split (temporal: last portion is validation) ──
+    # Train/val split (temporal: last portion is validation)
     n_total = len(dataset.graphs)
     n_val = max(1, int(n_total * config['validation_split']))
     n_train = n_total - n_val
@@ -278,16 +269,33 @@ def main():
     print(f"\nTrain: {n_train} frames (0-{n_train-1}), "
           f"Val: {n_val} frames ({n_train}-{n_total-1}), Batch: {batch_size}")
 
-    # ── Create model ──
+    # Create model
+    gnn_config = config['gnn'].copy()
+    gnn_config['core_elements'] = config.get('core_elements', elements)
+
+    # Build smooth/linear cutoff per pair from gap detection
+    gap_cuts = dataset.gap_cuts_angstrom or {}
+    cutoff_per_pair = np.full(num_pairs, 100.0)  # default: effectively no correction
+    for pair_name, cut_ang in gap_cuts.items():
+        if pair_name in pair_name_to_index:
+            cutoff_per_pair[pair_name_to_index[pair_name]] = cut_ang
+    cutoff_per_pair_bohr = cutoff_per_pair * ANGSTROM_TO_BOHR
+
+    print(f"\nSmooth/linear cutoffs (per pair):")
+    for i, pn in enumerate(pair_names):
+        if cutoff_per_pair[i] < 50:
+            print(f"  {pn}: {cutoff_per_pair[i]:.2f} A")
+
     model = GNNMorseModel(
         num_pairs=num_pairs,
         num_elements=num_elements,
         elements=elements,
         pair_names=pair_names,
-        gnn_config=config['gnn'],
+        gnn_config=gnn_config,
         init_D_e=init_D_e,
         init_alpha=init_alpha,
         init_r0=init_r0,
+        cutoff_per_pair=cutoff_per_pair_bohr,
     ).to(device)
 
     frozen_mask = frozen_mask.to(device)
@@ -312,7 +320,7 @@ def main():
     n_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_base} base Morse + {n_gnn} GNN = {n_total_params} total")
 
-    # ── VQ initialization ──
+    # VQ initialization
     vq_enabled = config['gnn'].get('vq_enabled', False)
     if vq_enabled:
         max_codes = config['gnn'].get('vq_max_codes', 4)
@@ -332,17 +340,16 @@ def main():
             if info['max_codes'] > 1:
                 print(f"  {elem}: {info['max_codes']} codes initialized")
 
-    # ── Optimizer ──
+    # Optimizer
     lr = config['learning_rate']
     min_lr = config['minimum_learning_rate']
     optimizer = torch.optim.Adam(
         [p for p in model.parameters() if p.requires_grad],
         lr=lr, weight_decay=config['weight_decay'])
 
-    # ── Training loop ──
+    # Training loop
     patience = config['convergence_patience']
     threshold = config['convergence_threshold']
-    time_limit = config['max_hours'] * 3600
 
     best_val_rmse = float('inf')
     best_model_state = None
@@ -359,11 +366,6 @@ def main():
     for epoch in range(1, 10000):
         elapsed = time.time() - train_start
 
-        # Check time limit
-        if elapsed > time_limit:
-            print(f"\nTime limit reached ({time_limit / 3600:.1f} hours)")
-            break
-
         # Check patience -> reduce LR or stop
         if epochs_without_improvement >= patience:
             current_lr = optimizer.param_groups[0]['lr']
@@ -376,7 +378,7 @@ def main():
             print(f"\n  Patience hit, LR: {current_lr:.0e} -> {new_lr:.0e}")
             epochs_without_improvement = 0
 
-        # ── Train one epoch ──
+        # Train one epoch
         model.train()
         batch_rmse_total = 0.0
         num_batches = 0
@@ -401,7 +403,7 @@ def main():
 
         train_rmse_ev = (batch_rmse_total / num_batches) * FORCE_AU_TO_EV_ANG
 
-        # ── Validate ──
+        # Validate
         model.eval()
         val_rmse_total = 0.0
         num_val_batches = 0
@@ -443,7 +445,7 @@ def main():
             if parts:
                 print(f"  VQ [{epoch}]: {', '.join(parts)}")
 
-    # ── Restore best model ──
+    # Restore best model
     if best_model_state is not None:
         vq_was_active = model.vq_active if vq_enabled else False
         model.load_state_dict(best_model_state)
@@ -453,7 +455,7 @@ def main():
 
     model.to(device)
 
-    # ── VQ summary ──
+    # VQ summary
     if vq_enabled and model.vq_active:
         util = model.vq.get_codebook_utilization()
         active_codes = model.vq.get_active_codes()
@@ -463,7 +465,7 @@ def main():
                 print(f"  {elem}: {active_codes[elem]} active codes "
                       f"(of {info['max_codes']} max), perplexity={info['perplexity']:.2f}")
 
-    # ── Print final Morse parameters ──
+    # Print final Morse parameters
     params = model.get_base_params_display()
     print(f"\n{'='*60}")
     print("FINAL BASE MORSE PARAMETERS")
@@ -478,7 +480,7 @@ def main():
         print(f"  {pair_name:>10} {params['D_e'][i]:12.6f} {params['alpha'][i]:12.6f} "
               f"{params['r0'][i]:12.6f}  {status}")
 
-    # ── Save checkpoint ──
+    # Save checkpoint
     checkpoint_path = os.path.join(results_dir, 'checkpoint.pt')
     torch.save({
         'epoch': epoch,
@@ -494,7 +496,7 @@ def main():
     }, checkpoint_path)
     print(f"Saved: {checkpoint_path}")
 
-    # ── Diagnostic plots ──
+    # Diagnostic plots
     generate_all_plots(
         model, dataset, device, config,
         train_rmse_history=train_rmse_history,
@@ -502,12 +504,12 @@ def main():
         output_dir=os.path.join(results_dir, 'plots'),
     )
 
-    # ── LAMMPS export ──
+    # LAMMPS export
     export_lammps(model, dataset, config,
                   output_dir=lammps_dir,
                   original_data=config.get('original_data'))
 
-    # ── Done ──
+    # Done
     total_time = time.time() - start_time
     print(f"\n{'='*60}")
     print(f"Done! Total time: {total_time:.1f}s")
@@ -517,10 +519,9 @@ def main():
     print('='*60)
 
     # Cleanup logging
-    log_handler.close()
-    logging.getLogger().removeHandler(log_handler)
-    sys.stdout = sys.stdout.stream if hasattr(sys.stdout, 'stream') else sys.stdout
-    sys.stderr = sys.stderr.stream if hasattr(sys.stderr, 'stream') else sys.stderr
+    log_file.close()
+    sys.stdout = sys.stdout.stream
+    sys.stderr = sys.stderr.stream
     print(f"Full log saved to: {log_path}")
 
     # Optional post-training analysis
