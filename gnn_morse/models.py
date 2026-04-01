@@ -12,17 +12,18 @@ from .utils import (
 class VectorQuantizer(nn.Module):
 
     def __init__(self, elements, embed_dim, max_codes_per_element=4,
-                 ema_decay=0.99, commitment_weight=0.25):
+                 core_elements=None, ema_decay=0.99, commitment_weight=0.25):
         super().__init__()
         self.elements = elements
         self.embed_dim = embed_dim
         self.ema_decay = ema_decay
         self.commitment_weight = commitment_weight
 
-        # C and H get 1 code (no subtypes), everything else gets max_codes
+        # Only core elements get multiple codes; everything else gets 1
+        core_set = set(core_elements) if core_elements else set(elements)
         self.n_codes_per_elem = {}
         for elem in elements:
-            self.n_codes_per_elem[elem] = 1 if elem in ('C', 'H') else max_codes_per_element
+            self.n_codes_per_elem[elem] = max_codes_per_element if elem in core_set else 1
 
         # Flat codebook: all element codes concatenated
         self.elem_offset = {}
@@ -243,7 +244,8 @@ class MorseParameterPredictor(nn.Module):
 class GNNMorseModel(nn.Module):
 
     def __init__(self, num_pairs, num_elements, elements, pair_names,
-                 gnn_config, init_D_e=None, init_alpha=None, init_r0=None):
+                 gnn_config, init_D_e=None, init_alpha=None, init_r0=None,
+                 cutoff_per_pair=None):
         super().__init__()
         self.num_pairs = num_pairs
         self.elements = elements
@@ -252,6 +254,16 @@ class GNNMorseModel(nn.Module):
 
         self.vq_enabled = gnn_config.get('vq_enabled', False)
         self.vq_active = False
+
+        # Smooth/linear cutoff per pair type (Bohr).
+        # F(r) = F_morse(r) - F_morse(rc) so force goes to zero at rc.
+        # Matches LAMMPS pair_style morse/smooth/linear.
+        if cutoff_per_pair is not None:
+            self.register_buffer('cutoff_per_pair',
+                torch.tensor(cutoff_per_pair, dtype=torch.float64))
+        else:
+            self.register_buffer('cutoff_per_pair',
+                torch.full((num_pairs,), 1000.0, dtype=torch.float64))
 
         # Default parameter initialization
         if init_D_e is None:
@@ -282,6 +294,7 @@ class GNNMorseModel(nn.Module):
                     elements=elements,
                     embed_dim=embed_dim,
                     max_codes_per_element=gnn_config.get('vq_max_codes', 4),
+                    core_elements=gnn_config.get('core_elements'),
                     ema_decay=gnn_config.get('vq_ema_decay', 0.99),
                     commitment_weight=gnn_config.get('vq_commitment_weight', 0.25),
                 )
@@ -317,6 +330,14 @@ class GNNMorseModel(nn.Module):
         x = batch.distances - r0
         exp_term = torch.exp(-alpha * x)
         scalar_force = 2.0 * D_e * alpha * (exp_term ** 2 - exp_term)  # -dV/dr
+
+        # Smooth/linear correction: F(r) = F_morse(r) - F_morse(rc)
+        # Matches LAMMPS pair_style morse/smooth/linear
+        rc = self.cutoff_per_pair[batch.pair_indices]
+        x_c = rc - r0
+        exp_c = torch.exp(-alpha * x_c)
+        force_at_cutoff = 2.0 * D_e * alpha * (exp_c ** 2 - exp_c)
+        scalar_force = scalar_force - force_at_cutoff
 
         # Accumulate forces on atoms
         force_vectors = -scalar_force.unsqueeze(1) * batch.edge_unit_vectors
