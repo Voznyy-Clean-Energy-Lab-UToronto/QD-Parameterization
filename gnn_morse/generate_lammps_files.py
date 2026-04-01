@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import re
 import os
 import numpy as np
 
@@ -7,36 +6,6 @@ from .utils import (
     base_element, canonical_pair, MASSES, FROZEN_LJ, BASE_PAIR_CUTOFFS,
     detect_atom_style, has_bonds_in_data,
 )
-
-
-def read_cluster_elements(mapping_path):
-    data = np.loadtxt(mapping_path, dtype=str, comments='#')
-    return sorted(set(data[:, 2]))
-
-
-def parse_table_params(table_path):
-    params = {}
-    pattern = re.compile(
-        r'^# (\S+) \(from (\S+)\): '
-        r'D_e=([\d.]+)\+/-[\d.]+ eV, '
-        r'alpha=([\d.]+)\+/-[\d.]+ /A, '
-        r'r0=([\d.]+)\+/-[\d.]+ A '
-        r'\((\d+) edges'
-        r'(?:, max_dist=([\d.]+), training_cutoff=([\d.]+))?\)')
-    with open(table_path) as f:
-        for line in f:
-            m = pattern.match(line)
-            if m:
-                n = int(m.group(6))
-                params[m.group(1)] = {
-                    'D_e': float(m.group(3)), 'alpha': float(m.group(4)),
-                    'r0': float(m.group(5)), 'n': n,
-                    'base': m.group(2), 'fallback': (n == 0),
-                    'max_edge_dist': float(m.group(7) or 0),
-                    'training_cutoff': float(m.group(8) or 0),
-                }
-    print(f"Parsed {len(params)} cluster-pair parameters from {table_path}")
-    return params
 
 
 def add_missing_pairs(params, cluster_elements):
@@ -126,7 +95,6 @@ def remap_data_file(original_path, mapping_path, output_path, cluster_elements):
           f"atom_style={atom_style})")
 
 
-# ── Shared pair_style + pair_coeff writer ────────────────────────────
 
 def _write_pair_style_and_coeffs(f, params, cluster_elements, has_bonds):
     elem_to_type = {e: i+1 for i, e in enumerate(cluster_elements)}
@@ -143,10 +111,10 @@ def _write_pair_style_and_coeffs(f, params, cluster_elements, has_bonds):
     use_lj = has_bonds and has_organic
 
     if use_lj:
-        f.write(f"pair_style  hybrid/overlay morse {max_morse_cutoff:.1f} lj/cut 10.0\n")
+        f.write(f"pair_style  hybrid/overlay morse/smooth/linear {max_morse_cutoff:.1f} lj/cut 10.0\n")
     else:
-        f.write(f"pair_style  morse {max_morse_cutoff:.1f}\n")
-    f.write("pair_modify shift yes\n\n")
+        f.write(f"pair_style  morse/smooth/linear {max_morse_cutoff:.1f}\n")
+    f.write("\n")
 
     # Morse pairs
     f.write("# ── GNN-TRAINED MORSE PAIRS ──\n")
@@ -161,7 +129,7 @@ def _write_pair_style_and_coeffs(f, params, cluster_elements, has_bonds):
         train_cut = data.get('training_cutoff', 0.0)
         cutoff = train_cut if train_cut > 0 else BASE_PAIR_CUTOFFS.get(data['base'], 7.5)
         fb = " [fallback]" if data.get('fallback') else ""
-        style_prefix = "morse " if use_lj else ""
+        style_prefix = "morse/smooth/linear " if use_lj else ""
         f.write(f"pair_coeff  {t1} {t2} {style_prefix}"
                 f"{data['D_e']:.8f}  {data['alpha']:.8f}  {data['r0']:.8f}  {cutoff:.2f}"
                 f"  # {cp_name}{fb}\n")
@@ -184,17 +152,6 @@ def _write_pair_style_and_coeffs(f, params, cluster_elements, has_bonds):
                     f.write(f"pair_coeff  {t1} {t2} lj/cut "
                             f"{vals['eps']:.8f}  {vals['sigma']:.5f}"
                             f"  # {canonical_pair(v1, v2)} ({pn})\n")
-
-
-def write_potentials_file(params, filepath, cluster_elements, has_bonds=True):
-    with open(filepath, 'w') as f:
-        f.write(f"# GNN-Morse Fitted Potential\n")
-        f.write(f"# {len(cluster_elements)} atom types: "
-                f"{', '.join(f'{e}={i+1}' for i, e in enumerate(cluster_elements))}\n")
-        f.write(f"#\n")
-        f.write(f"# Usage: include this file in your LAMMPS input script after read_data\n\n")
-        _write_pair_style_and_coeffs(f, params, cluster_elements, has_bonds)
-    print(f"Wrote {filepath}")
 
 
 def write_lammps_input(params, filepath, cluster_elements, data_file='gnn_morse.data',
@@ -248,85 +205,4 @@ run              {nsteps}
     print(f"Wrote {filepath}")
 
 
-def write_potential_file(params, filepath):
-    with open(filepath, 'w') as f:
-        f.write("# GNN-Morse fitted parameters (local run)\n")
-        f.write("# pair  type  param1  param2  param3\n")
-        for cp_name in sorted(params.keys()):
-            data = params[cp_name]
-            bp = canonical_pair(base_element(cp_name.split('-')[0]),
-                                base_element(cp_name.split('-')[1]))
-            fb = "  FROZEN" if data.get('fallback') else ""
-            f.write(f"{bp} morse {data['D_e']:.6f} {data['alpha']:.6f} {data['r0']:.6f}{fb}\n")
-    # Base-pair averaged version for analyze_MD.py
-    base_filepath = filepath.replace('.txt', '_base.txt')
-    base_params = {}
-    base_counts = {}
-    for cp_name, data in params.items():
-        bp = data['base']
-        n = max(data['n'], 1)
-        if bp not in base_params:
-            base_params[bp] = {'D_e': 0, 'alpha': 0, 'r0': 0}
-            base_counts[bp] = 0
-        base_params[bp]['D_e'] += data['D_e'] * n
-        base_params[bp]['alpha'] += data['alpha'] * n
-        base_params[bp]['r0'] += data['r0'] * n
-        base_counts[bp] += n
-    with open(base_filepath, 'w') as f:
-        f.write("# GNN-Morse base-pair averaged parameters\n")
-        for bp in sorted(base_params.keys()):
-            n = base_counts[bp]
-            f.write(f"{bp} morse {base_params[bp]['D_e']/n:.6f} "
-                    f"{base_params[bp]['alpha']/n:.6f} {base_params[bp]['r0']/n:.6f}\n")
-        for pn in sorted(FROZEN_LJ.keys()):
-            vals = FROZEN_LJ[pn]
-            f.write(f"{pn} lj {vals['eps']:.6f} {vals['sigma']:.6f}\n")
-    print(f"Wrote {base_filepath}")
 
-
-def main(table_file=None, mapping_file=None, original_data=None, output_dir=None,
-         temp=300, nsteps=8707):
-    if not all([table_file, mapping_file, original_data, output_dir]):
-        raise ValueError("table_file, mapping_file, original_data, and output_dir are required")
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    cluster_elements = read_cluster_elements(mapping_file)
-    print(f"Atom types ({len(cluster_elements)}): {cluster_elements}")
-
-    bonds = has_bonds_in_data(original_data)
-    atom_style = detect_atom_style(original_data)
-    print(f"Data file: atom_style={atom_style}, has_bonds={bonds}")
-
-    params = parse_table_params(table_file)
-    params = add_missing_pairs(params, cluster_elements)
-
-    data_path = os.path.join(output_dir, 'gnn_morse.data')
-    remap_data_file(original_data, mapping_file, data_path, cluster_elements)
-
-    input_path = os.path.join(output_dir, 'gnn_morse.in')
-    write_lammps_input(params, input_path, cluster_elements,
-                       temp=temp, nsteps=nsteps, has_bonds=bonds)
-
-    pot_dir = os.path.join(output_dir, 'potentials')
-    os.makedirs(pot_dir, exist_ok=True)
-    write_potential_file(params, os.path.join(pot_dir, 'gnn_morse.txt'))
-
-    print(f"\nAll files generated in {output_dir}/")
-    print(f"  cd {output_dir}")
-    print(f"  lmp -in gnn_morse.in")
-
-
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Generate LAMMPS files from GNN-Morse output')
-    parser.add_argument('--table-file', required=True)
-    parser.add_argument('--mapping-file', required=True)
-    parser.add_argument('--original-data', required=True)
-    parser.add_argument('--output-dir', required=True)
-    parser.add_argument('--temp', type=int, default=300)
-    parser.add_argument('--nsteps', type=int, default=8707)
-    args = parser.parse_args()
-    main(table_file=args.table_file, mapping_file=args.mapping_file,
-         original_data=args.original_data, output_dir=args.output_dir,
-         temp=args.temp, nsteps=args.nsteps)
