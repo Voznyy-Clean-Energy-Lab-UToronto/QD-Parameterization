@@ -1,30 +1,9 @@
 #!/usr/bin/env python3
-"""
-Full analysis pipeline: run LAMMPS MD, analyze trajectory, force rerun.
-
-Usage (from repo root):
-    python -m gnn_morse_local.run_analysis gnn_morse_local/runs/Cd68Se55_300K/
-
-Options:
-    --skip-md       Skip MD, just analyze existing trajectories
-    --skip-rerun    Skip force rerun
-    --no-infante    Skip Infante reference MD
-    --lammps-bin    Path to LAMMPS binary (default: lmp)
-
-Outputs (all in run_dir/analysis/):
-    rdf.png              - RDF comparison (DFT vs GNN-Morse vs Infante)
-    structural.png       - Structural phase space density
-    energy_stability.png - PE and temperature over time
-    potentials.png       - Cluster sub-type curves + Infante reference
-    force_rerun.png      - Force parity + per-frame RMSE
-"""
 
 import os
-import sys
 import io
 import subprocess
 import argparse
-import re
 
 import numpy as np
 import yaml
@@ -37,9 +16,6 @@ import matplotlib.pyplot as plt
 from .utils import base_element, FROZEN_LJ
 
 
-# ============================================================
-# CONSTANTS
-# ============================================================
 
 RDF_R_MAX = 12.0
 RDF_BIN_WIDTH = 0.05
@@ -47,7 +23,6 @@ BOND_CUTOFF = 3.5
 SKIP_FRAMES = 10
 
 ATOM_MAP = {'Cd': 1, 'Se': 2, 'C': 3, 'H': 4, 'O': 5}
-ATOM_MAP_INV = {v: k for k, v in ATOM_MAP.items()}
 
 COULOMB_CONST = 14.3996
 
@@ -99,9 +74,6 @@ pair_coeff       5 5  0.001502177   3.2072353853
 """
 
 
-# ============================================================
-# TRAJECTORY PARSING
-# ============================================================
 
 def parse_xyz_frames(filepath, skip_frames=0):
     if not os.path.exists(filepath):
@@ -174,9 +146,6 @@ def _parse_standard_xyz(content, skip_frames=0):
     return frames
 
 
-# ============================================================
-# RDF
-# ============================================================
 
 def compute_rdf(frames, atom1, atom2, box=None, r_max=RDF_R_MAX, bin_width=RDF_BIN_WIDTH):
     n_bins = int(r_max / bin_width)
@@ -210,9 +179,6 @@ def compute_rdf(frames, atom1, atom2, box=None, r_max=RDF_R_MAX, bin_width=RDF_B
     return r_bins, hist
 
 
-# ============================================================
-# STRUCTURAL ANALYSIS
-# ============================================================
 
 def analyze_structure(frames, center='Cd', neighbor='Se', cutoff=BOND_CUTOFF):
     paired_dists = []
@@ -248,9 +214,6 @@ def analyze_structure(frames, center='Cd', neighbor='Se', cutoff=BOND_CUTOFF):
     return np.array([]), np.array([])
 
 
-# ============================================================
-# LOG PARSING
-# ============================================================
 
 def parse_lammps_log(filepath):
     data = {'step': [], 'temp': [], 'pe': [], 'ke': [], 'etotal': [], 'press': []}
@@ -279,18 +242,8 @@ def parse_lammps_log(filepath):
     return {k: np.array(v) for k, v in data.items()} if data['step'] else None
 
 
-# ============================================================
-# POTENTIALS PARSING (cluster sub-types from potentials.txt)
-# ============================================================
 
 def parse_cluster_potentials(filepath):
-    """Parse potentials.txt, extracting per-cluster-pair Morse params.
-
-    Returns:
-        cluster_params: {base_pair: [(cluster_name, D_e, alpha, r0, is_fallback), ...]}
-            e.g. {'Cd-Se': [('Cd_0-Se_2', 0.68, 1.88, 2.57, False), ...]}
-        lj_params: {base_pair: (eps, sigma)}  for frozen organic LJ pairs
-    """
     if not os.path.exists(filepath):
         return {}, {}
 
@@ -323,17 +276,18 @@ def parse_cluster_potentials(filepath):
 
             try:
                 if is_hybrid:
-                    # hybrid format: pair_coeff T1 T2 morse D_e alpha r0 cut
+                    # hybrid format: pair_coeff T1 T2 morse/smooth/linear D_e alpha r0 cut
                     style = parts[3]
-                    if style == 'morse' and len(parts) >= 8:
+                    if style.startswith('morse') and len(parts) >= 8:
                         D_e, alpha, r0 = float(parts[4]), float(parts[5]), float(parts[6])
+                        cutoff = float(parts[7])
                         is_fallback = '[fallback]' in comment.lower()
                         cluster_name = comment.split()[0] if comment else ''
                         if '-' in cluster_name:
                             ce1, ce2 = cluster_name.split('-')
                             bp = '-'.join(sorted([base_element(ce1), base_element(ce2)]))
                             cluster_params.setdefault(bp, []).append(
-                                (cluster_name, D_e, alpha, r0, is_fallback))
+                                (cluster_name, D_e, alpha, r0, is_fallback, cutoff))
                     elif style == 'lj/cut' and len(parts) >= 6:
                         eps, sigma = float(parts[4]), float(parts[5])
                         if comment:
@@ -344,25 +298,22 @@ def parse_cluster_potentials(filepath):
                     # direct morse format: pair_coeff T1 T2 D_e alpha r0 cut
                     if len(parts) >= 7:
                         D_e, alpha, r0 = float(parts[3]), float(parts[4]), float(parts[5])
+                        cutoff = float(parts[6]) if len(parts) >= 7 else 10.0
                         is_fallback = '[fallback]' in comment.lower()
                         cluster_name = comment.split()[0] if comment else ''
                         if '-' in cluster_name:
                             ce1, ce2 = cluster_name.split('-')
                             bp = '-'.join(sorted([base_element(ce1), base_element(ce2)]))
                             cluster_params.setdefault(bp, []).append(
-                                (cluster_name, D_e, alpha, r0, is_fallback))
+                                (cluster_name, D_e, alpha, r0, is_fallback, cutoff))
             except (ValueError, IndexError):
                 continue
 
     return cluster_params, lj_params
 
 
-# ============================================================
-# INFANTE MD
-# ============================================================
 
 def run_infante_md(original_data, results_dir, temp=300, nsteps=10000, lammps_bin='lmp'):
-    """Run Infante LJ+Coulomb MD using the original .data file."""
     if not original_data or not os.path.exists(original_data):
         print(f"  [Skip] Original .data not found: {original_data}")
         return None, None
@@ -416,9 +367,6 @@ def run_infante_md(original_data, results_dir, temp=300, nsteps=10000, lammps_bi
     return infante_xyz, infante_log
 
 
-# ============================================================
-# PLOTTING
-# ============================================================
 
 def plot_rdf(rdf_data, output_file, rdf_pairs):
     print("  Generating RDF plot...")
@@ -543,11 +491,6 @@ def plot_energy_stability(log_data, output_file):
 
 
 def plot_potentials(cluster_params, output_file):
-    """Plot cluster sub-type Morse curves + Infante LJ+Coul reference.
-
-    One subplot per base pair (Cd-Se, Cd-Cd, Se-Se, Cd-O, Se-O).
-    Each cluster sub-type gets its own curve; fallbacks are dimmed.
-    """
     print("  Generating potential curves (sub-types + Infante)...")
     base_pairs = ['Cd-Se', 'Cd-Cd', 'Se-Se', 'Cd-O', 'O-Se']
 
@@ -579,12 +522,18 @@ def plot_potentials(cluster_params, output_file):
         real_variants = []
         fallback_variants = []
         if bp in cluster_params:
-            for name, D, a, r0, is_fb in cluster_params[bp]:
-                if is_fb:
-                    fallback_variants.append((name, D, a, r0))
+            for entry in cluster_params[bp]:
+                # Handle both old (5-tuple) and new (6-tuple with cutoff) formats
+                if len(entry) == 6:
+                    name, D, a, r0, is_fb, cut = entry
                 else:
-                    real_variants.append((name, D, a, r0))
-        # Sort by D_e (strongest first)
+                    name, D, a, r0, is_fb = entry
+                    cut = 10.0
+                if is_fb:
+                    fallback_variants.append((name, D, a, r0, cut))
+                else:
+                    real_variants.append((name, D, a, r0, cut))
+        # Sort by D_e (strongest first); D_e is index 1
         real_variants.sort(key=lambda x: -x[1])
 
         # Infante LJ+Coul curve
@@ -599,7 +548,7 @@ def plot_potentials(cluster_params, output_file):
             infante_v = v_lj + v_coul
 
         # Compute y-limits from Morse wells
-        all_depths = [D for _, D, _, _ in real_variants]
+        all_depths = [D for _, D, _, _, _ in real_variants]
         if all_depths:
             max_D = max(all_depths)
             v_min = -max_D * 1.5
@@ -621,9 +570,17 @@ def plot_potentials(cluster_params, output_file):
             ax.plot(r, v_display, color='black', lw=2.5, ls='--',
                     label='Infante (LJ+Coul)', zorder=10, alpha=0.8)
 
-        # Plot real cluster sub-types
-        for idx, (name, D, a, r0) in enumerate(real_variants):
-            v = D * (1 - np.exp(-a * (r - r0)))**2 - D
+        # Plot real cluster sub-types (smooth/linear: V goes to 0 at cutoff)
+        for idx, (name, D, a, r0, rc) in enumerate(real_variants):
+            exp1 = np.exp(-a * (r - r0))
+            v_morse = D * (1 - exp1)**2 - D  # LAMMPS convention: well at -D
+
+            # Smooth/linear correction: V(rc)=0, F(rc)=0
+            exp_c = np.exp(-a * (rc - r0))
+            v_c = D * (1 - exp_c)**2 - D
+            dv_dr_c = 2 * D * a * (exp_c - exp_c**2)
+            v = v_morse - v_c - dv_dr_c * (r - rc)
+            v[r > rc] = 0.0
             v_display = np.clip(v, v_min - 1, v_max + 1)
             # Shorten label: "Cd_0-Se_2" -> just the cluster indices
             label = name
@@ -656,7 +613,6 @@ def plot_potentials(cluster_params, output_file):
 
 
 def plot_force_rerun(dft_forces, lammps_forces, symbols, core_elements, output_file):
-    """Force parity + per-frame RMSE plot."""
     print("  Generating force rerun plot...")
     core_mask = np.isin(symbols, list(core_elements))
     dft_f = dft_forces[:, core_mask]
@@ -702,17 +658,12 @@ def plot_force_rerun(dft_forces, lammps_forces, symbols, core_elements, output_f
     return overall
 
 
-# ============================================================
-# FORCE RERUN
-# ============================================================
 
 def run_force_rerun(lammps_dir, dft_xyz, core_elements, results_dir, lammps_bin='lmp'):
-    """Feed DFT positions through LAMMPS potential, compare forces."""
     import ase.io
 
     mapping_file = os.path.join(lammps_dir, 'atom_type_mapping.txt')
     data_file = os.path.join(lammps_dir, 'gnn_morse.data')
-    potentials_file = os.path.join(lammps_dir, 'potentials.txt')
     lammps_in = os.path.join(lammps_dir, 'gnn_morse.in')
 
     if not os.path.exists(mapping_file):
@@ -764,13 +715,6 @@ def run_force_rerun(lammps_dir, dft_xyz, core_elements, results_dir, lammps_bin=
                 s = line.strip()
                 if s.startswith(('pair_style', 'pair_coeff', 'pair_modify')):
                     potential_cmds.append(s)
-                elif s.startswith('include') and 'potentials.txt' in s:
-                    if os.path.exists(potentials_file):
-                        with open(potentials_file) as pf:
-                            for pl in pf:
-                                ps = pl.strip()
-                                if ps.startswith(('pair_style', 'pair_coeff', 'pair_modify')):
-                                    potential_cmds.append(ps)
 
     if not potential_cmds:
         print("  [Skip] No potential commands found")
@@ -847,13 +791,9 @@ def run_force_rerun(lammps_dir, dft_xyz, core_elements, results_dir, lammps_bin=
     return overall
 
 
-# ============================================================
-# MAIN
-# ============================================================
 
 def main_from_fitter(run_dir, config_path, lammps_bin='lmp', infante=True,
                      nsteps=10000, temp=300):
-    """Entry point called from gnn_morse_fitter after training+export."""
     _run_pipeline(
         run_dir=os.path.abspath(run_dir),
         config_path=os.path.abspath(config_path),
@@ -868,7 +808,6 @@ def main_from_fitter(run_dir, config_path, lammps_bin='lmp', infante=True,
 
 def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
                   infante, nsteps, temp):
-    """Core analysis pipeline shared by main() and main_from_fitter()."""
     lammps_dir = os.path.join(run_dir, 'lammps')
     results_dir = os.path.join(run_dir, 'analysis')
     os.makedirs(results_dir, exist_ok=True)
@@ -910,7 +849,7 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
     else:
         print("  [Warning] No config found, using defaults")
 
-    # ── Step 1: Run LAMMPS MD (GNN-Morse + optionally Infante) ──
+    # Step 1: Run LAMMPS MD
     lammps_in = os.path.join(lammps_dir, 'gnn_morse.in')
     md_xyz = os.path.join(lammps_dir, 'gnn_morse.xyz')
     md_log = os.path.join(lammps_dir, 'gnn_morse.log')
@@ -959,7 +898,7 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
         print(f"  [Error] No trajectory found: {md_xyz}")
         return
 
-    # ── Step 2: Analyze MD ──
+    # Step 2: Analyze MD
     print(f"\n{'─'*60}")
     print("  Step 2: Analyzing MD trajectories")
     print(f"{'─'*60}")
@@ -1033,15 +972,12 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
     if log_data:
         plot_energy_stability(log_data, os.path.join(results_dir, 'energy_stability.png'))
 
-    # Potential curves (cluster sub-types from potentials.txt or gnn_morse.in)
-    potentials_file = os.path.join(lammps_dir, 'potentials.txt')
-    if not os.path.exists(potentials_file):
-        potentials_file = os.path.join(lammps_dir, 'gnn_morse.in')
-    cluster_params, _ = parse_cluster_potentials(potentials_file)
+    # Potential curves (cluster sub-types from gnn_morse.in)
+    cluster_params, _ = parse_cluster_potentials(os.path.join(lammps_dir, 'gnn_morse.in'))
     if cluster_params:
         plot_potentials(cluster_params, os.path.join(results_dir, 'potentials.png'))
 
-    # ── Step 3: Force rerun ──
+    # Step 3: Force rerun
     if not skip_rerun:
         print(f"\n{'─'*60}")
         print("  Step 3: LAMMPS Force Rerun")
