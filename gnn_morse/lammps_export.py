@@ -1,76 +1,22 @@
 import os
+from collections import Counter
+
 import numpy as np
 
 from .utils import (
-    HARTREE_TO_EV, BOHR_TO_ANGSTROM, canonical_pair, base_element,
-    has_bonds_in_data,
+    HARTREE_TO_EV, BOHR_TO_ANGSTROM, ANGSTROM_TO_BOHR,
+    canonical_pair, base_element,
+    has_bonds_in_data, detect_atom_style,
+    MASSES, CHARMM_LJ, ORGANIC_ELEMENTS,
 )
+from .labelling import classify_atoms
 
 
-def _describe_vq_types(atom_types, symbols, edge_index_np, inorganic_elements):
-    # Label VQ codes as core/surf by coordination ranking.
-    # Highest cross-species coordination = core, rest = surf.
-    inorganic_set = set(inorganic_elements)
-    n_atoms = len(symbols)
-    src, tgt = edge_index_np[0], edge_index_np[1]
-
-    # Per-atom neighbor counts
-    cross_coord = np.zeros(n_atoms, dtype=int)
-    total_inorg_coord = np.zeros(n_atoms, dtype=int)
-    has_ligand = np.zeros(n_atoms, dtype=bool)
-
-    for s, t in zip(src, tgt):
-        if symbols[s] in inorganic_set:
-            if symbols[t] in inorganic_set:
-                total_inorg_coord[s] += 1
-                if symbols[t] != symbols[s]:
-                    cross_coord[s] += 1
-            else:
-                has_ligand[s] = True
-
-    # Group VQ codes by element
-    unique_types = sorted(set(atom_types))
-    elem_codes = {}  # {elem: [code_name, ...]}
-    for tname in unique_types:
-        elem = tname.partition('_')[0]
-        elem_codes.setdefault(elem, []).append(tname)
-
-    label_map = {}
-
-    for elem, codes in elem_codes.items():
-        # Non-inorganic: bare element name
-        if elem not in inorganic_set:
-            for tname in codes:
-                label_map[tname] = elem if len(codes) == 1 else tname
-            continue
-
-        # Single code: just element name
-        if len(codes) == 1:
-            label_map[codes[0]] = elem
-            continue
-
-        # Multiple codes: rank by coordination to assign core/surf
-        scores = []
-        for tname in codes:
-            idx = [i for i, t in enumerate(atom_types) if t == tname]
-            mean_cross = float(np.mean(cross_coord[idx]))
-            mean_total = float(np.mean(total_inorg_coord[idx]))
-            frac_lig = float(np.mean(has_ligand[idx]))
-            # Composite: higher cross, higher total, less ligand → core
-            scores.append((mean_cross, mean_total, -frac_lig, tname))
-
-        # Sort descending — highest score = core
-        scores.sort(reverse=True)
-        label_map[scores[0][3]] = f"{elem}_core"
-        for _, _, _, tname in scores[1:]:
-            label_map[tname] = f"{elem}_surf"
-
-    return label_map
-
+#  _build_cluster_pair_edges
 
 def _build_cluster_pair_edges(edge_index, atom_types, per_edge_params,
                               pair_indices, pair_names, frozen_pairs,
-                              edge_distances_angstrom=None):
+                              edge_distances_angstrom=None, fallback_De=0.001):
     edge_src = edge_index[0]
     edge_tgt = edge_index[1]
 
@@ -124,18 +70,21 @@ def _build_cluster_pair_edges(edge_index, atom_types, per_edge_params,
         }
 
     # Fill missing cluster-pair combinations with near-zero D_e
+    # (skip organic-organic pairs — those use CHARMM LJ instead)
     cluster_types = sorted(set(atom_types))
     for i, ct1 in enumerate(cluster_types):
         for ct2 in cluster_types[i:]:
             cp_name = canonical_pair(ct1, ct2)
             if cp_name in result:
                 continue
+            if _is_organic_pair(cp_name):
+                continue
             bp = canonical_pair(base_element(ct1), base_element(ct2))
             if bp in frozen_set or bp not in base_pair_medians:
                 continue
             med = base_pair_medians[bp]
             result[cp_name] = {
-                'D_e': 0.001, 'alpha': med['alpha'], 'r0': med['r0'],
+                'D_e': fallback_De, 'alpha': med['alpha'], 'r0': med['r0'],
                 'D_e_std': 0.0, 'alpha_std': 0.0, 'r0_std': 0.0,
                 'n': 0, 'base': bp,
                 'fallback': True, 'max_edge_dist': 0.0,
@@ -144,8 +93,229 @@ def _build_cluster_pair_edges(edge_index, atom_types, per_edge_params,
     return result
 
 
+#  LAMMPS file generation
+
+def add_missing_pairs(params, cluster_elements, fallback_De=0.001):
+    n_added = 0
+    for i, ct1 in enumerate(cluster_elements):
+        for ct2 in cluster_elements[i:]:
+            cp = canonical_pair(ct1, ct2)
+            if cp in params:
+                continue
+            if _is_organic_pair(cp):
+                continue  # organic-organic pairs use CHARMM LJ
+            bp = canonical_pair(base_element(ct1), base_element(ct2))
+            params[cp] = {
+                'D_e': fallback_De, 'alpha': 1.0, 'r0': 5.0,
+                'n': 0, 'base': bp, 'fallback': True,
+            }
+            n_added += 1
+    if n_added:
+        print(f"Added {n_added} fallback pairs (H-Se etc.)")
+    return params
+
+
+def remap_data_file(original_path, mapping_path, output_path, cluster_elements):
+    mapping = np.loadtxt(mapping_path, dtype=str, comments='#')
+    atom_to_new_type = {int(row[0]): int(row[1]) for row in mapping}
+
+    num_new_types = len(cluster_elements)
+    elem_to_type = {e: i+1 for i, e in enumerate(cluster_elements)}
+
+    atom_style = detect_atom_style(original_path)
+    type_col = 2 if atom_style == 'full' else 1
+    min_cols = 7 if atom_style == 'full' else 6
+
+    with open(original_path) as f:
+        lines = f.readlines()
+
+    atoms_start = None
+    atoms_end = None
+    for i, line in enumerate(lines):
+        if line.strip() == 'Atoms' or line.strip().startswith('Atoms #'):
+            atoms_start = i + 2
+        elif atoms_start is not None and atoms_end is None:
+            if line.strip() in ('Bonds', 'Velocities', 'Angles', 'Dihedrals',
+                                'Impropers', 'Pair Coeffs', 'Bond Coeffs'):
+                atoms_end = i
+    if atoms_end is None:
+        atoms_end = len(lines)
+
+    with open(output_path, 'w') as f:
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            if 'atom types' in line:
+                f.write(f"     {num_new_types}  atom types\n")
+                i += 1
+                continue
+
+            if line.strip() == 'Masses':
+                f.write(line)
+                f.write('\n')
+                for elem in cluster_elements:
+                    tid = elem_to_type[elem]
+                    base = base_element(elem)
+                    mass = MASSES.get(base, 1.0)
+                    f.write(f"     {tid}   {mass:.4f}  # {elem}\n")
+                i += 2
+                while i < len(lines) and lines[i].strip():
+                    i += 1
+                continue
+
+            if atoms_start is not None and i >= atoms_start and i < atoms_end:
+                tokens = line.split()
+                if len(tokens) >= min_cols and tokens[0].isdigit():
+                    atom_id = int(tokens[0])
+                    if atom_id in atom_to_new_type:
+                        tokens[type_col] = str(atom_to_new_type[atom_id])
+                    f.write(' '.join(tokens) + '\n')
+                    i += 1
+                    continue
+
+            f.write(line)
+            i += 1
+
+    print(f"Wrote {output_path} ({num_new_types} atom types, {len(atom_to_new_type)} atoms remapped, "
+          f"atom_style={atom_style})")
+
+
+def _is_organic_pair(cp_name):
+    e1, e2 = cp_name.split('-')
+    b1, b2 = base_element(e1), base_element(e2)
+    return b1 in ORGANIC_ELEMENTS and b2 in ORGANIC_ELEMENTS
+
+
+def _write_pair_style_and_coeffs(f, params, cluster_elements, has_bonds,
+                                 inorganic_elements=None):
+    elem_to_type = {e: i+1 for i, e in enumerate(cluster_elements)}
+
+    # Check if any organic elements exist (need hybrid for CHARMM LJ)
+    has_organic = any(base_element(ce) in ORGANIC_ELEMENTS for ce in cluster_elements)
+
+    # Max morse cutoff from training cutoffs
+    max_morse_cutoff = 7.5
+    for cp_name, data in params.items():
+        if _is_organic_pair(cp_name):
+            continue  # organic pairs use LJ, not Morse
+        pair_cut = data.get('training_cutoff', 7.5)
+        max_morse_cutoff = max(max_morse_cutoff, pair_cut)
+
+    lj_cutoff = 4.0
+
+    if has_organic:
+        f.write(f"pair_style  hybrid/overlay morse {max_morse_cutoff:.1f} lj/cut {lj_cutoff:.1f}\n")
+    else:
+        f.write(f"pair_style  morse {max_morse_cutoff:.1f}\n")
+    f.write("pair_modify shift yes\n")
+    f.write("\n")
+
+    # Morse pairs (inorganic-inorganic and inorganic-ligand)
+    f.write("# -- MORSE PAIRS (GNN-fitted) --\n")
+    f.write("#                         D_e(eV)      alpha(1/A)   r0(A)        cutoff(A)\n")
+
+    for cp_name in sorted(params.keys()):
+        if _is_organic_pair(cp_name):
+            continue  # handled below as LJ
+        data = params[cp_name]
+        e1, e2 = cp_name.split('-')
+        t1, t2 = elem_to_type.get(e1), elem_to_type.get(e2)
+        if t1 is None or t2 is None:
+            continue
+        cutoff = data.get('training_cutoff', 7.5)
+        fb = " [fallback]" if data.get('fallback') else ""
+        if has_organic:
+            f.write(f"pair_coeff  {t1} {t2} morse "
+                    f"{data['D_e']:.8f}  {data['alpha']:.8f}  {data['r0']:.8f}  {cutoff:.2f}"
+                    f"  # {cp_name}{fb}\n")
+        else:
+            f.write(f"pair_coeff  {t1} {t2} "
+                    f"{data['D_e']:.8f}  {data['alpha']:.8f}  {data['r0']:.8f}  {cutoff:.2f}"
+                    f"  # {cp_name}{fb}\n")
+
+    # CHARMM LJ pairs (organic-organic only)
+    if has_organic:
+        f.write("\n# -- CHARMM LJ PAIRS (organic-organic, frozen) --\n")
+        f.write("#                         epsilon(eV)  sigma(A)\n")
+        written_lj = set()
+        for i, ce1 in enumerate(cluster_elements):
+            for ce2 in cluster_elements[i:]:
+                cp = canonical_pair(ce1, ce2)
+                if not _is_organic_pair(cp):
+                    continue
+                if cp in written_lj:
+                    continue
+                b1, b2 = base_element(ce1), base_element(ce2)
+                bp = canonical_pair(b1, b2)
+                lj = CHARMM_LJ.get(bp)
+                if lj is None:
+                    continue
+                t1, t2 = elem_to_type[ce1], elem_to_type[ce2]
+                f.write(f"pair_coeff  {t1} {t2} lj/cut "
+                        f"{lj['epsilon']:.6f}  {lj['sigma']:.4f}"
+                        f"  # {cp} (CHARMM)\n")
+                written_lj.add(cp)
+
+
+def write_lammps_input(params, filepath, cluster_elements, data_file='gnn_morse.data',
+                       temp=300, nsteps=8707, has_bonds=True,
+                       inorganic_elements=None):
+    elem_names = [base_element(ce) for ce in cluster_elements]
+
+    with open(filepath, 'w') as f:
+        f.write(f"# LAMMPS Input: GNN-Morse fitted potential\n")
+        f.write(f"# {len(cluster_elements)} atom types: "
+                f"{', '.join(f'{e}={i+1}' for i, e in enumerate(cluster_elements))}\n\n")
+        f.write("units           metal\n")
+
+        if has_bonds:
+            f.write("atom_style      full\n")
+            f.write("improper_style  harmonic\n")
+            f.write("bond_style      harmonic\n")
+            f.write("angle_style     harmonic\n")
+        else:
+            f.write("atom_style      charge\n")
+
+        f.write("boundary        f f f\n\n")
+
+        if has_bonds:
+            f.write("special_bonds    charmm\n")
+        f.write(f"read_data       {data_file}\n")
+        if has_bonds:
+            f.write("special_bonds    charmm\n")
+        f.write("\n")
+
+        _write_pair_style_and_coeffs(f, params, cluster_elements, has_bonds,
+                                     inorganic_elements=inorganic_elements)
+
+        f.write(f"""
+neighbor         2.0 bin
+neigh_modify     delay 0 every 1 check yes
+timestep         0.001
+
+thermo           100
+thermo_style     custom step temp pe ke etotal press
+log              gnn_morse.log
+
+dump             1 all custom 1 gnn_morse.xyz element xu yu zu vx vy vz fx fy fz
+dump_modify      1 element {' '.join(elem_names)}
+dump_modify      1 sort id
+
+velocity         all create {temp} 12345
+fix              1 all nve
+fix              2 all temp/csvr {temp}.0 {temp}.0 0.1 54321
+
+run              {nsteps}
+""")
+    print(f"Wrote {filepath}")
+
+
+#  export_lammps
+
 def export_lammps(model, dataset, config, output_dir,
-                  original_data=None, temp=300):
+                  original_data=None, temp=300, atom_detail='medium',
+                  fallback_De=0.001):
     import torch
 
     print(f"\n{'='*60}")
@@ -159,41 +329,50 @@ def export_lammps(model, dataset, config, output_dir,
     per_edge_params = model_cpu.get_per_edge_params(graph)
     symbols = dataset.frame_data[0][0]
     inorganic = sorted(set(config.get('knn_edges', {}).get('inorganic_elements', ['Cd', 'Se'])))
-    edge_index_np = graph.edge_index.numpy()
+
+    # Get cutoffs
+    cutoffs_bohr = getattr(dataset, 'cutoffs_bohr', None)
+    if cutoffs_bohr is None:
+        gap_cuts = getattr(dataset, 'gap_cuts_angstrom', {}) or {}
+        cutoffs_bohr = {pair: cut * ANGSTROM_TO_BOHR
+                        for pair, cut in gap_cuts.items()}
 
     # Atom classification
     vq_result = model_cpu.get_atom_types(graph)
 
     if vq_result is not None:
-        # VQ path: atom types from trained codebook, relabeled by coordination
-        vq_indices, atom_types = vq_result
+        # VQ active: use physical labelling
+        from .labelling import compute_physical_labels
+        _, vq_type_names = vq_result
+        physical_labels, label_info = compute_physical_labels(
+            symbols, dataset.frame_data[0][1], vq_type_names,
+            inorganic, cutoffs_bohr,
+            frame_data=dataset.frame_data, stride=10)
+        atom_labels = physical_labels
 
-        # Rename VQ codes to descriptive labels (e.g. Cd_0 -> Cd_core_4Se)
-        label_map = _describe_vq_types(atom_types, symbols, edge_index_np, inorganic)
-        atom_types = [label_map[t] for t in atom_types]
-
+        # Build type_legend from label_info
         type_legend = {}
-        for old_name, new_name in sorted(set(label_map.items())):
-            count = sum(1 for t in atom_types if t == new_name)
-            elem = old_name.partition('_')[0]
-            type_legend[new_name] = {
-                'count': count,
-                'description': f"{elem}, {new_name} ({count} atoms)",
-            }
+        for label, info in label_info.items():
+            base = label.partition('_')[0]
+            if base in set(inorganic) and '_' in label:
+                desc = (f"{base}, {label} (n={info['count']}, "
+                        f"CN={info['mean_cn']:.1f}, "
+                        f"ss={info['mean_surface_score']:.2f})")
+            else:
+                desc = f"{label} ({info['count']} atoms)"
+            type_legend[label] = {'count': info['count'], 'description': desc}
 
         active_codes = model_cpu.vq.get_active_codes()
         active_str = ', '.join(f"{e}={n}" for e, n in active_codes.items()
                                if model_cpu.vq.n_codes_per_elem[e] > 1)
-        print(f"\nAtom classification (VQ codebook, active codes: {active_str}):")
-
+        print(f"\nAtom classification (VQ + physical labels, active: {active_str}):")
     else:
-        # No VQ: each element is one atom type (no subtypes)
-        atom_types = list(symbols)
-        type_legend = {}
-        for elem in sorted(set(symbols)):
-            count = sum(1 for s in symbols if s == elem)
-            type_legend[elem] = {'count': count, 'description': f"{elem} ({count} atoms)"}
-        print(f"\nAtom classification (element-based, no subtypes):")
+        # No VQ: fallback to CN-based classification
+        atom_labels, type_legend, _ = classify_atoms(
+            symbols, dataset.frame_data, cutoffs_bohr, inorganic,
+            stride=10, atom_detail=atom_detail)
+
+    atom_types = atom_labels
 
     # Print type legend
     max_name = max(len(t) for t in type_legend) if type_legend else 10
@@ -221,22 +400,35 @@ def export_lammps(model, dataset, config, output_dir,
 
     # Build cluster-pair-averaged parameters
     frozen_pairs = set(config.get('fixed_pairs', {}).keys())
+    edge_index_np = graph.edge_index.numpy()
 
     pair_indices = graph.pair_indices.numpy()
     edge_dists_ang = graph.distances.numpy() * BOHR_TO_ANGSTROM
     cluster_pair_data = _build_cluster_pair_edges(
         edge_index_np, atom_types, per_edge_params,
         pair_indices, dataset.pair_names, frozen_pairs,
-        edge_distances_angstrom=edge_dists_ang)
+        edge_distances_angstrom=edge_dists_ang, fallback_De=fallback_De)
 
-    # Attach training cutoffs
-    gap_cuts = getattr(dataset, 'gap_cuts_angstrom', {}) or {}
-    if gap_cuts:
-        print(f"\nTraining cutoffs (gap_cut per base pair):")
-        for bp in sorted(gap_cuts):
-            print(f"  {bp}: {gap_cuts[bp]:.2f} A")
+    # Attach cutoffs for LAMMPS pair_style morse
+    cutoffs_ang = getattr(dataset, 'gap_cuts_angstrom', None) or {}
+
+    print(f"\nMorse cutoffs for LAMMPS (from training):")
     for cp_name, d in cluster_pair_data.items():
-        d['training_cutoff'] = gap_cuts.get(d['base'], 0.0)
+        bp = d['base']
+        if bp in cutoffs_ang:
+            d['training_cutoff'] = cutoffs_ang[bp]
+        else:
+            d['training_cutoff'] = 7.5
+            print(f"  WARNING: {bp} not in training cutoffs, using 7.5 A fallback")
+
+    # Print summary per base pair
+    bp_cutoffs = {}
+    for cp_name, d in cluster_pair_data.items():
+        bp = d['base']
+        tc = d.get('training_cutoff', 7.5)
+        bp_cutoffs[bp] = max(bp_cutoffs.get(bp, 0), tc)
+    for bp in sorted(bp_cutoffs):
+        print(f"  {bp}: {bp_cutoffs[bp]:.2f} A")
 
     # Print cluster pair statistics
     n_fallback = sum(1 for d in cluster_pair_data.values() if d.get('fallback'))
@@ -257,7 +449,7 @@ def export_lammps(model, dataset, config, output_dir,
     # Diagnose fallback pairs
     if n_fallback > 0:
         print(f"\n  -- Fallback Diagnosis ({n_fallback} pairs) --")
-        organic_bases = {'C', 'H', 'O'}
+        organic_bases = set(base_element(ce) for ce in cluster_elements) - set(inorganic)
         expected, surprising = [], []
         for cp_name, d in sorted(cluster_pair_data.items()):
             if not d.get('fallback'):
@@ -293,10 +485,7 @@ def export_lammps(model, dataset, config, output_dir,
     print(f"Saved: {mapping_path}")
 
     if original_data and os.path.exists(original_data):
-        from .generate_lammps_files import (
-            remap_data_file, write_lammps_input, add_missing_pairs,
-        )
-        params = add_missing_pairs(cluster_pair_data, cluster_elements)
+        params = add_missing_pairs(cluster_pair_data, cluster_elements, fallback_De=fallback_De)
         has_bonds = has_bonds_in_data(original_data)
         print(f"\nLAMPS export: original_data={original_data}, has_bonds={has_bonds}")
 
@@ -304,6 +493,7 @@ def export_lammps(model, dataset, config, output_dir,
                         os.path.join(output_dir, 'gnn_morse.data'),
                         cluster_elements)
         write_lammps_input(params, os.path.join(output_dir, 'gnn_morse.in'),
-                           cluster_elements, temp=temp, has_bonds=has_bonds)
+                           cluster_elements, temp=temp, has_bonds=has_bonds,
+                           inorganic_elements=inorganic)
 
     return atom_types, type_legend, cluster_pair_data, cluster_elements
