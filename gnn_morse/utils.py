@@ -15,43 +15,32 @@ def inverse_softplus(x):
         return float(np.log(np.expm1(x)))
     return torch.log(torch.expm1(x))
 
-
+# makes sure Cd-Se and Se-Cd are treated as the same thing.
 def canonical_pair(elem_a, elem_b):
     if elem_a <= elem_b:
         return f"{elem_a}-{elem_b}"
-    return f"{elem_b}-{elem_a}"
+    return f"{elem_b}-{elem_a}" 
 
-
+#remove the labelling, so it's just Cd not Cd_core_Se3 for example
 def base_element(cluster_type):
     return cluster_type.partition('_')[0]
 
 
 MASSES = {'C': 12.011, 'Cd': 112.411, 'H': 1.008, 'O': 15.999, 'Se': 78.971}
 
-FROZEN_LJ = {
-    'C-C':  {'eps': 0.00135800, 'sigma': 3.20724},
-    'C-H':  {'eps': 0.00035300, 'sigma': 3.02015},
-    'C-O':  {'eps': 0.00142800, 'sigma': 3.20724},
-    'H-H':  {'eps': 0.00009200, 'sigma': 2.84197},
-    'H-O':  {'eps': 0.00037200, 'sigma': 3.02015},
-    'O-O':  {'eps': 0.00150200, 'sigma': 3.20724},
+# CHARMM36 LJ parameters for organic-organic pairs (formate ligands).
+CHARMM_LJ = {
+    'C-C':  {'epsilon': 0.003035, 'sigma': 3.564},
+    'C-H':  {'epsilon': 0.002020, 'sigma': 2.905},
+    'C-O':  {'epsilon': 0.003974, 'sigma': 3.296},
+    'H-H':  {'epsilon': 0.001344, 'sigma': 2.245},
+    'H-O':  {'epsilon': 0.002645, 'sigma': 2.637},
+    'O-O':  {'epsilon': 0.005203, 'sigma': 3.028},
 }
 
-# Per-base-pair cutoffs matching training edge distances
-BASE_PAIR_CUTOFFS = {
-    'Cd-Se': 3.5,
-    'Cd-Cd': 7.0,
-    'Se-Se': 7.5,
-    'C-Cd':  4.5,
-    'C-Se':  4.5,
-    'Cd-H':  4.5,
-    'Cd-O':  4.5,
-    'H-Se':  4.5,
-    'O-Se':  4.5,
-}
+ORGANIC_ELEMENTS = {'C', 'H', 'O'}
 
-
-
+# Reading LAMMPS data file for use in lammps_export.py
 def detect_atom_style(filepath):
     with open(filepath) as f:
         for line in f:
@@ -77,7 +66,7 @@ def detect_atom_style(filepath):
                 return 'full' if len(line.split()) >= 7 else 'charge'
     return 'full'
 
-
+# To determine if the LAMMPS data file has bonds or not (related to filling in CHARMM details). also for lammps_export.py
 def has_bonds_in_data(filepath):
     with open(filepath) as f:
         for line in f:
