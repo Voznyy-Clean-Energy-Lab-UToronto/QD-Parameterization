@@ -5,8 +5,6 @@ from ase import Atoms
 from ase.neighborlist import neighbor_list
 from itertools import combinations_with_replacement
 from scipy.spatial.distance import cdist
-from scipy.ndimage import gaussian_filter1d
-from scipy.signal import argrelmax, argrelmin
 from torch_geometric.data import Data
 
 from .utils import (
@@ -96,88 +94,6 @@ def read_lammps_dump(filepath, first_n=None):
 
     return atom_symbols, positions_list, forces_list
 
-
-#  RDF-based cutoff detection
-
-def compute_rdf_cutoff(frame_data, symbols, elem_a, elem_b,
-                       r_max_ang=8.0, bin_width_ang=0.05,
-                       sigma=2.0, stride=10, min_peak_height=0.1,
-                       threshold_frac=0.02):
-#Find first shell cutoff using RDF. After first peak, find minima. Minima threshold is 2% of max peak height.
-    symbols_arr = np.array(symbols)
-    idx_a = np.where(symbols_arr == elem_a)[0]
-    idx_b = np.where(symbols_arr == elem_b)[0]
-
-    if len(idx_a) == 0 or len(idx_b) == 0:
-        return None
-
-    same_species = (elem_a == elem_b)
-    n_bins = int(r_max_ang / bin_width_ang)
-    r_edges_ang = np.linspace(0, r_max_ang, n_bins + 1)
-    r_centers_ang = 0.5 * (r_edges_ang[:-1] + r_edges_ang[1:])
-    hist = np.zeros(n_bins, dtype=np.float64)
-    n_frames_used = 0
-
-    for fi in range(0, len(frame_data), max(1, stride)):
-        _, pos_bohr = frame_data[fi]
-        pos_ang = np.asarray(pos_bohr) * BOHR_TO_ANGSTROM
-
-        dists = cdist(pos_ang[idx_a], pos_ang[idx_b]).ravel()
-        if same_species:
-            dists = dists[dists > 0.01]
-
-        hist += np.histogram(dists, bins=r_edges_ang)[0]
-        n_frames_used += 1
-
-    if n_frames_used == 0 or hist.sum() == 0:
-        return None
-
-    # Smooth
-    smoothed = gaussian_filter1d(hist.astype(np.float64), sigma=sigma)
-
-    # Normalize so max = 1
-    max_val = smoothed.max()
-    if max_val <= 0:
-        return None
-    smoothed_norm = smoothed / max_val
-
-    # Find peaks
-    peak_idx = argrelmax(smoothed_norm, order=3)[0]
-    peak_idx = peak_idx[smoothed_norm[peak_idx] > min_peak_height]
-
-    if len(peak_idx) == 0:
-        return None
-
-    first_peak = peak_idx[0]
-    peak_height = smoothed_norm[first_peak]
-
-    #find where the RDF drops below a threshold after the first peak.
-    drop_threshold = peak_height * threshold_frac
-
-    #find where smoothed drops below threshold after peak
-    after_peak = smoothed_norm[first_peak:]
-    below_thresh = np.where(after_peak < drop_threshold)[0]
-
-    if len(below_thresh) > 0:
-        cutoff_idx = first_peak + below_thresh[0]
-        cutoff_ang = r_centers_ang[cutoff_idx]
-    else:
-        #look for formal minimum (argrelmin)
-        min_idx = argrelmin(smoothed_norm, order=3)[0]
-        min_after_peak = min_idx[min_idx > first_peak]
-        if len(min_after_peak) == 0:
-            min_idx_wide = argrelmin(smoothed_norm, order=5)[0]
-            min_after_peak = min_idx_wide[min_idx_wide > first_peak]
-        if len(min_after_peak) == 0:
-            return None
-        cutoff_idx = min_after_peak[0]
-        cutoff_ang = r_centers_ang[cutoff_idx]
-
-    peak_ang = r_centers_ang[first_peak]
-    if cutoff_ang <= peak_ang or cutoff_ang > r_max_ang * 0.95:
-        return None
-
-    return cutoff_ang * ANGSTROM_TO_BOHR
 
 #The dreaded "gap detection". In order to find if it is "first shell" or longer, bypassing knn_edges (pseudo-coordination number), it detects if there's a "gap"
 # For example, if I have a max CN of 4, and 4 nearest neighbours are at: 2.30A, 2.32A, 2.34A, 5.32A, then I know the 5.32A is in a different "shell" and wont be counted.
