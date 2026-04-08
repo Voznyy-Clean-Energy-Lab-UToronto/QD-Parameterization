@@ -7,7 +7,7 @@ from matplotlib.colors import LogNorm
 import torch
 from torch_geometric.loader import DataLoader
 
-from .utils import BOHR_TO_ANGSTROM, ANGSTROM_TO_BOHR, FORCE_AU_TO_EV_ANG, ORGANIC_ELEMENTS
+from .utils import BOHR_TO_ANGSTROM, ANGSTROM_TO_BOHR, FORCE_AU_TO_EV_ANG
 from .labelling import classify_atoms, _compute_cross_species_cn
 
 
