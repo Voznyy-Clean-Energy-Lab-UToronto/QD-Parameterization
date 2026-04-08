@@ -2,7 +2,7 @@ import numpy as np
 from ase import Atoms
 from ase.neighborlist import neighbor_list
 
-from .utils import BOHR_TO_ANGSTROM, canonical_pair, ORGANIC_ELEMENTS
+from .utils import BOHR_TO_ANGSTROM, canonical_pair
 
 
 #  Helpers
