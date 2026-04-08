@@ -1,10 +1,7 @@
 import argparse
 import os
 
-import numpy as np
 import torch
-
-from .utils import BOHR_TO_ANGSTROM, ANGSTROM_TO_BOHR
 
 
 def visualize(checkpoint_path, config_path, output_path='structure_vq.xyz'):
