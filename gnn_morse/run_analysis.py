@@ -13,7 +13,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from .utils import base_element, FROZEN_LJ
+from .utils import base_element
 
 
 
@@ -145,6 +145,47 @@ def _parse_standard_xyz(content, skip_frames=0):
             frames.append({'atoms': np.array(atoms), 'coords': coords})
     return frames
 
+
+
+def compute_adf(frames, center, neighbor, cutoff=BOND_CUTOFF, n_bins=90):
+    angle_edges = np.linspace(0, 180, n_bins + 1)
+    angle_bins = 0.5 * (angle_edges[:-1] + angle_edges[1:])
+    hist = np.zeros(n_bins)
+    total_triplets = 0
+
+    for frame in frames:
+        atoms = frame['atoms']
+        coords = frame['coords']
+        center_idx = np.where(atoms == center)[0]
+        neighbor_idx = np.where(atoms == neighbor)[0]
+        if len(center_idx) == 0 or len(neighbor_idx) == 0:
+            continue
+
+        center_pos = coords[center_idx]
+        neighbor_pos = coords[neighbor_idx]
+        all_dists = cdist(center_pos, neighbor_pos)
+
+        for ci in range(len(center_pos)):
+            dists_row = all_dists[ci]
+            bond_mask = dists_row < cutoff
+            bonded = np.where(bond_mask)[0]
+            if len(bonded) < 2:
+                continue
+            vecs = neighbor_pos[bonded] - center_pos[ci]
+            dists = dists_row[bonded]
+            unit_vecs = vecs / dists[:, np.newaxis]
+            cos_mat = np.clip(unit_vecs @ unit_vecs.T, -1.0, 1.0)
+            tri_i, tri_j = np.triu_indices(len(bonded), k=1)
+            angles = np.degrees(np.arccos(cos_mat[tri_i, tri_j]))
+            hist += np.histogram(angles, bins=angle_edges)[0]
+            total_triplets += len(tri_i)
+
+    if total_triplets > 0:
+        bin_width_deg = angle_edges[1] - angle_edges[0]
+        density = hist / (total_triplets * bin_width_deg)
+    else:
+        density = hist
+    return angle_bins, density
 
 
 def compute_rdf(frames, atom1, atom2, box=None, r_max=RDF_R_MAX, bin_width=RDF_BIN_WIDTH):
@@ -360,8 +401,11 @@ def run_infante_md(original_data, results_dir, temp=300, nsteps=10000, lammps_bi
         print(f"  [Error] LAMMPS binary '{lammps_bin}' not found.")
         return None, None
     if result.returncode != 0:
-        print(f"  [Error] Infante MD failed:\n{result.stderr[-1000:]}")
-        return None, None
+        if os.path.exists(infante_xyz) and os.path.getsize(infante_xyz) > 0:
+            print(f"  [Warning] Infante LAMMPS exited with code {result.returncode} but trajectory exists — continuing.")
+        else:
+            print(f"  [Error] Infante MD failed:\n{result.stderr[-1000:]}")
+            return None, None
 
     print(f"  Infante MD complete.")
     return infante_xyz, infante_log
@@ -413,6 +457,58 @@ def plot_rdf(rdf_data, output_file, rdf_pairs):
     fig.legend(handles, leg_labels, loc='upper center',
                bbox_to_anchor=(0.5, 0.98), ncol=min(5, len(labels)), fontsize=9)
     fig.suptitle("Radial Distribution Functions", fontsize=14, y=1.0)
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.93, hspace=0.08)
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {output_file}")
+
+
+def plot_adf(adf_data, output_file, adf_triplets):
+    """Plot angular distribution functions, same style as plot_rdf."""
+    print("  Generating ADF plot...")
+    triplet_keys = [f"{n}-{c}-{n}" for c, n in adf_triplets]
+    fig, axes = plt.subplots(len(triplet_keys), 1,
+                              figsize=(10, 3.5 * len(triplet_keys)), sharex=True)
+    axes = np.atleast_1d(axes)
+    labels = list(adf_data.keys())
+
+    color_map = {}
+    for label in labels:
+        if 'DFT' in label:
+            color_map[label] = 'black'
+        elif 'Infante' in label:
+            color_map[label] = 'tab:red'
+        else:
+            color_map[label] = 'steelblue'
+
+    for ax, triplet in zip(axes, triplet_keys):
+        for label, triplet_data in adf_data.items():
+            if triplet in triplet_data:
+                angles, density = triplet_data[triplet]
+                c = color_map.get(label, 'steelblue')
+                if 'DFT' in label:
+                    ax.plot(angles, density, color='black', ls='--', lw=2,
+                            label=label, zorder=100)
+                    ax.fill_between(angles, density, alpha=0.05, color='black')
+                elif 'Infante' in label:
+                    ax.plot(angles, density, color=c, lw=1.8, label=label,
+                            alpha=0.85, zorder=50)
+                else:
+                    ax.plot(angles, density, color=c, lw=1.5, label=label,
+                            alpha=0.9)
+        ax.set_ylabel("Density")
+        ax.set_xlim(0, 180)
+        ax.text(0.95, 0.85, triplet, transform=ax.transAxes, ha='right',
+                fontweight='bold', fontsize=11,
+                bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("Angle (degrees)")
+    handles, leg_labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, leg_labels, loc='upper center',
+               bbox_to_anchor=(0.5, 0.98), ncol=min(5, len(labels)), fontsize=9)
+    fig.suptitle("Angular Distribution Functions", fontsize=14, y=1.0)
     fig.tight_layout()
     fig.subplots_adjust(top=0.93, hspace=0.08)
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -570,16 +666,15 @@ def plot_potentials(cluster_params, output_file):
             ax.plot(r, v_display, color='black', lw=2.5, ls='--',
                     label='Infante (LJ+Coul)', zorder=10, alpha=0.8)
 
-        # Plot real cluster sub-types (smooth/linear: V goes to 0 at cutoff)
+        # Plot real cluster sub-types (shifted Morse: V(rc)=0)
         for idx, (name, D, a, r0, rc) in enumerate(real_variants):
             exp1 = np.exp(-a * (r - r0))
-            v_morse = D * (1 - exp1)**2 - D  # LAMMPS convention: well at -D
+            v_morse = D * (1 - exp1)**2 - D  # well at -D
 
-            # Smooth/linear correction: V(rc)=0, F(rc)=0
+            # Shift so V(rc)=0 (matches LAMMPS pair_modify shift yes)
             exp_c = np.exp(-a * (rc - r0))
-            v_c = D * (1 - exp_c)**2 - D
-            dv_dr_c = 2 * D * a * (exp_c - exp_c**2)
-            v = v_morse - v_c - dv_dr_c * (r - rc)
+            v_at_cutoff = D * (1 - exp_c)**2 - D
+            v = v_morse - v_at_cutoff
             v[r > rc] = 0.0
             v_display = np.clip(v, v_min - 1, v_max + 1)
             # Shorten label: "Cd_0-Se_2" -> just the cluster indices
@@ -674,7 +769,25 @@ def run_force_rerun(lammps_dir, dft_xyz, core_elements, results_dir, lammps_bin=
         return
 
     print(f"\n  Loading DFT trajectory: {os.path.basename(dft_xyz)}")
-    dft_frames = ase.io.read(dft_xyz, index=':', format='extxyz')
+    # Detect format from file content
+    is_lammps_dump = False
+    with open(dft_xyz) as _f:
+        first_line = _f.readline().strip()
+        if 'ITEM: TIMESTEP' in first_line:
+            is_lammps_dump = True
+    if is_lammps_dump:
+        from .data import read_lammps_dump
+        from .utils import FORCE_AU_TO_EV_ANG, BOHR_TO_ANGSTROM
+        syms, pos_list, frc_list = read_lammps_dump(dft_xyz)
+        # Convert back from atomic units to eV/Ang for analysis
+        dft_frames = []
+        for pos_bohr, frc_au in zip(pos_list, frc_list):
+            atoms = ase.Atoms(symbols=syms, positions=pos_bohr * BOHR_TO_ANGSTROM)
+            if frc_au is not None:
+                atoms.arrays['forces'] = frc_au * FORCE_AU_TO_EV_ANG
+            dft_frames.append(atoms)
+    else:
+        dft_frames = ase.io.read(dft_xyz, index=':', format='extxyz')
     dft_symbols = [a.symbol for a in dft_frames[0]]
 
     data = np.loadtxt(mapping_file, dtype=str, comments='#')
@@ -692,10 +805,13 @@ def run_force_rerun(lammps_dir, dft_xyz, core_elements, results_dir, lammps_bin=
     with open(dft_dump, 'w') as f:
         for step, frame in enumerate(dft_frames):
             pos = frame.positions
-            try:
-                dft_forces_list.append(frame.get_forces())
-            except Exception:
-                dft_forces_list.append(np.zeros((n_atoms, 3)))
+            if 'forces' in frame.arrays:
+                dft_forces_list.append(frame.arrays['forces'])
+            else:
+                try:
+                    dft_forces_list.append(frame.get_forces())
+                except Exception:
+                    dft_forces_list.append(np.zeros((n_atoms, 3)))
             f.write(f"ITEM: TIMESTEP\n{step}\n"
                     f"ITEM: NUMBER OF ATOMS\n{n_atoms}\n"
                     f"ITEM: BOX BOUNDS pp pp pp\n"
@@ -765,8 +881,11 @@ def run_force_rerun(lammps_dir, dft_xyz, core_elements, results_dir, lammps_bin=
         print(f"  [Error] LAMMPS binary '{lammps_bin}' not found. Skipping rerun.")
         return
     if result.returncode != 0:
-        print(f"  [Error] LAMMPS rerun failed:\n{result.stderr[-1000:]}")
-        return
+        if os.path.exists(rerun_dump) and os.path.getsize(rerun_dump) > 0:
+            print(f"  [Warning] LAMMPS rerun exited with code {result.returncode} but output exists — continuing.")
+        else:
+            print(f"  [Error] LAMMPS rerun failed:\n{result.stderr[-1000:]}")
+            return
     print("  LAMMPS rerun completed")
 
     with open(rerun_dump) as f:
@@ -793,7 +912,7 @@ def run_force_rerun(lammps_dir, dft_xyz, core_elements, results_dir, lammps_bin=
 
 
 def main_from_fitter(run_dir, config_path, lammps_bin='lmp', infante=True,
-                     nsteps=10000, temp=300):
+                     nsteps=10000, temp=300, atom_detail='medium'):
     _run_pipeline(
         run_dir=os.path.abspath(run_dir),
         config_path=os.path.abspath(config_path),
@@ -803,57 +922,44 @@ def main_from_fitter(run_dir, config_path, lammps_bin='lmp', infante=True,
         infante=infante,
         nsteps=nsteps,
         temp=temp,
+        atom_detail=atom_detail,
     )
 
 
-def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
-                  infante, nsteps, temp):
-    lammps_dir = os.path.join(run_dir, 'lammps')
-    results_dir = os.path.join(run_dir, 'analysis')
-    os.makedirs(results_dir, exist_ok=True)
+def _update_lammps_input(filepath, temp, nsteps, dump_every=None):
+    import re
+    with open(filepath) as f:
+        lines = f.readlines()
+    new_lines = []
+    for line in lines:
+        s = line.strip()
+        if s.startswith('velocity') and 'create' in s:
+            # velocity all create <temp> <seed>
+            new_lines.append(re.sub(
+                r'(velocity\s+all\s+create\s+)\d+(\s+\d+)',
+                rf'\g<1>{temp}\2', line))
+        elif s.startswith('fix') and 'temp/csvr' in s:
+            # fix N all temp/csvr <T> <T> <damp> <seed>
+            new_lines.append(re.sub(
+                r'(fix\s+\S+\s+all\s+temp/csvr\s+)\S+\s+\S+',
+                rf'\g<1>{temp}.0 {temp}.0', line))
+        elif s.startswith('run'):
+            new_lines.append(f'run              {nsteps}\n')
+        elif dump_every is not None and s.startswith('dump') and 'custom' in s:
+            # dump 1 all custom <freq> ...
+            new_lines.append(re.sub(
+                r'(dump\s+\S+\s+all\s+custom\s+)\d+',
+                rf'\g<1>{dump_every}', line))
+        else:
+            new_lines.append(line)
+    with open(filepath, 'w') as f:
+        f.writelines(new_lines)
 
-    print("=" * 60)
-    print("  GNN-Morse Full Analysis")
-    print("=" * 60)
-    print(f"  Run dir: {run_dir}")
-    print(f"  LAMMPS dir: {lammps_dir}")
 
-    # Load config
-    box_dims = [27.5, 27.5, 27.5]
-    dft_xyz = None
-    original_data = None
-    core_elements = ['Cd', 'Se']
-    rdf_pairs = [('Cd', 'Se'), ('Cd', 'Cd'), ('Se', 'Se'), ('Cd', 'O'), ('Se', 'O')]
-
-    if config_path and os.path.exists(config_path):
-        config_dir = os.path.dirname(os.path.abspath(config_path))
-        with open(config_path) as f:
-            config = yaml.safe_load(f)
-        bs = config.get('training', {}).get('box_size_angstrom', 27.5)
-        box_dims = [bs, bs, bs]
-        core_elements = config.get('training', {}).get('core_elements', core_elements)
-        # Resolve paths relative to config dir
-        datasets = config.get('datasets', [])
-        if datasets:
-            xyz_rel = datasets[0].get('xyz', '')
-            dft_xyz = os.path.normpath(os.path.join(config_dir, xyz_rel))
-        od = config.get('original_data', '')
-        if od:
-            original_data = os.path.normpath(os.path.join(config_dir, od))
-        print(f"  Box size: {bs} A")
-        print(f"  Core elements: {core_elements}")
-        if dft_xyz:
-            print(f"  DFT trajectory: {dft_xyz}")
-        if original_data:
-            print(f"  Original .data: {original_data}")
-    else:
-        print("  [Warning] No config found, using defaults")
-
-    # Step 1: Run LAMMPS MD
+def _run_md(lammps_dir, results_dir, original_data, skip_md, infante,
+            nsteps, temp, lammps_bin):
     lammps_in = os.path.join(lammps_dir, 'gnn_morse.in')
     md_xyz = os.path.join(lammps_dir, 'gnn_morse.xyz')
-    md_log = os.path.join(lammps_dir, 'gnn_morse.log')
-
     infante_xyz = None
     infante_log = None
 
@@ -862,11 +968,11 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
         print("  Step 1: Running LAMMPS MD")
         print(f"{'─'*60}")
 
-        # GNN-Morse MD
         if not os.path.exists(lammps_in):
             print(f"\n  [Error] {lammps_in} not found.")
             print("  Run the fitter first: gnn-morse config.yaml")
-            return
+            return md_xyz, None, None
+        _update_lammps_input(lammps_in, temp, nsteps)
         print(f"\n  Running GNN-Morse MD ({nsteps} steps at {temp}K)...")
         try:
             result = subprocess.run(
@@ -874,36 +980,39 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
                 cwd=lammps_dir, capture_output=True, text=True, timeout=3600)
         except FileNotFoundError:
             print(f"  [Error] LAMMPS binary '{lammps_bin}' not found.")
-            return
+            return md_xyz, None, None
         if result.returncode != 0:
-            print(f"  [Error] LAMMPS MD failed:\n{result.stderr[-2000:]}")
-            return
+            if os.path.exists(md_xyz) and os.path.getsize(md_xyz) > 0:
+                print(f"  [Warning] LAMMPS exited with code {result.returncode} but trajectory exists — continuing.")
+            else:
+                print(f"  [Error] LAMMPS MD failed:\n{result.stderr[-2000:]}")
+                return md_xyz, None, None
         print(f"  GNN-Morse MD complete.")
 
-        # Infante MD
         if infante:
             infante_xyz, infante_log = run_infante_md(
                 original_data, results_dir,
                 temp=temp, nsteps=nsteps, lammps_bin=lammps_bin)
     else:
         print(f"\n  Skipping MD (--skip-md)")
-        # Check for existing Infante trajectory
         existing_inf = os.path.join(results_dir, 'infante', 'infante.xyz')
         existing_inf_log = os.path.join(results_dir, 'infante', 'infante.log')
         if os.path.exists(existing_inf):
             infante_xyz = existing_inf
             infante_log = existing_inf_log
 
-    if not os.path.exists(md_xyz):
-        print(f"  [Error] No trajectory found: {md_xyz}")
-        return
+    return md_xyz, infante_xyz, infante_log
 
-    # Step 2: Analyze MD
+
+def _analyze_and_plot(results_dir, lammps_dir, md_xyz, dft_xyz, infante_xyz,
+                      infante_log, box_dims, rdf_pairs, core_elements,
+                      skip_rerun, lammps_bin):
     print(f"\n{'─'*60}")
     print("  Step 2: Analyzing MD trajectories")
     print(f"{'─'*60}")
 
     box = box_dims + [90.0, 90.0, 90.0]
+    md_log = os.path.join(lammps_dir, 'gnn_morse.log')
     rdf_data = {}
     struct_data = {}
     log_data = {}
@@ -921,11 +1030,10 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
             r, theta = analyze_structure(dft_frames)
             struct_data['DFT'] = {'r': r, 'theta': theta}
 
-    # Truncate MD trajectories to DFT length for fair comparison
     n_dft = len(dft_frames)
+    infante_frames = []
 
     # Infante
-    infante_frames = []
     if infante_xyz and os.path.exists(infante_xyz):
         print(f"\n  Loading Infante trajectory...")
         infante_frames = parse_xyz_frames(infante_xyz, skip_frames=SKIP_FRAMES)
@@ -963,21 +1071,42 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
         if gnn_data:
             log_data['GNN-Morse'] = gnn_data
 
+    # Compute ADF (Se-Cd-Se and Cd-Se-Cd)
+    adf_triplets = [('Cd', 'Se'), ('Se', 'Cd')]  # (center, neighbor)
+    adf_data = {}
+    if dft_frames:
+        adf_data['DFT'] = {}
+        for center, neighbor in adf_triplets:
+            key = f"{neighbor}-{center}-{neighbor}"
+            adf_data['DFT'][key] = compute_adf(dft_frames, center, neighbor)
+    if infante_frames:
+        adf_data['Infante'] = {}
+        for center, neighbor in adf_triplets:
+            key = f"{neighbor}-{center}-{neighbor}"
+            adf_data['Infante'][key] = compute_adf(infante_frames, center, neighbor)
+    if md_frames:
+        adf_data['GNN-Morse'] = {}
+        for center, neighbor in adf_triplets:
+            key = f"{neighbor}-{center}-{neighbor}"
+            adf_data['GNN-Morse'][key] = compute_adf(md_frames, center, neighbor)
+
     # Generate plots
     print("\n  Generating plots...")
     if rdf_data:
         plot_rdf(rdf_data, os.path.join(results_dir, 'rdf.png'), rdf_pairs)
+    if adf_data:
+        plot_adf(adf_data, os.path.join(results_dir, 'adf.png'), adf_triplets)
     if struct_data:
         plot_structural(struct_data, os.path.join(results_dir, 'structural.png'))
     if log_data:
         plot_energy_stability(log_data, os.path.join(results_dir, 'energy_stability.png'))
 
-    # Potential curves (cluster sub-types from gnn_morse.in)
+    # Potential curves
     cluster_params, _ = parse_cluster_potentials(os.path.join(lammps_dir, 'gnn_morse.in'))
     if cluster_params:
         plot_potentials(cluster_params, os.path.join(results_dir, 'potentials.png'))
 
-    # Step 3: Force rerun
+    # Force rerun
     if not skip_rerun:
         print(f"\n{'─'*60}")
         print("  Step 3: LAMMPS Force Rerun")
@@ -990,13 +1119,71 @@ def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
     else:
         print(f"\n  Skipping force rerun (--skip-rerun)")
 
+    return results_dir
+
+
+def _run_pipeline(run_dir, config_path, lammps_bin, skip_md, skip_rerun,
+                  infante, nsteps, temp, atom_detail='medium'):
+    lammps_dir = os.path.join(run_dir, 'lammps')
+    results_dir = os.path.join(run_dir, 'analysis')
+    os.makedirs(results_dir, exist_ok=True)
+
+    print("=" * 60)
+    print("  GNN-Morse Full Analysis")
+    print("=" * 60)
+    print(f"  Run dir: {run_dir}")
+    print(f"  LAMMPS dir: {lammps_dir}")
+    print(f"  Atom detail: {atom_detail}")
+
+    # Load config
+    box_dims = [27.5, 27.5, 27.5]
+    dft_xyz = None
+    original_data = None
+    core_elements = ['Cd', 'Se']
+    rdf_pairs = [('Cd', 'Se'), ('Cd', 'Cd'), ('Se', 'Se'), ('Cd', 'O'), ('Se', 'O')]
+
+    if config_path and os.path.exists(config_path):
+        config_dir = os.path.dirname(os.path.abspath(config_path))
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+        bs = config.get('training', {}).get('box_size_angstrom', 27.5)
+        box_dims = [bs, bs, bs]
+        core_elements = config.get('training', {}).get('core_elements', core_elements)
+        datasets = config.get('datasets', [])
+        if datasets:
+            xyz_rel = datasets[0].get('xyz', '')
+            dft_xyz = os.path.normpath(os.path.join(config_dir, xyz_rel))
+        od = config.get('original_data', '')
+        if od:
+            original_data = os.path.normpath(os.path.join(config_dir, od))
+        print(f"  Box size: {bs} A")
+        print(f"  Core elements: {core_elements}")
+        if dft_xyz:
+            print(f"  DFT trajectory: {dft_xyz}")
+    else:
+        print("  [Warning] No config found, using defaults")
+
+    # Step 1: Run MD
+    md_xyz, infante_xyz, infante_log = _run_md(
+        lammps_dir, results_dir, original_data, skip_md, infante,
+        nsteps, temp, lammps_bin)
+
+    if not os.path.exists(md_xyz):
+        print(f"  [Error] No trajectory found: {md_xyz}")
+        return
+
+    # Steps 2-3: Analyze and plot
+    _analyze_and_plot(
+        results_dir, lammps_dir, md_xyz, dft_xyz, infante_xyz, infante_log,
+        box_dims, rdf_pairs, core_elements, skip_rerun, lammps_bin)
+
     # Summary
     print(f"\n{'='*60}")
     print("  ANALYSIS COMPLETE")
     print(f"{'='*60}")
     print(f"  Output: {results_dir}/")
-    for f in ['rdf.png', 'structural.png', 'energy_stability.png',
-              'potentials.png', 'force_rerun.png']:
+    for f in ['rdf.png', 'adf.png', 'structural.png', 'energy_stability.png',
+              'potentials.png', 'cn_vs_label.png', 'force_rerun.png']:
         path = os.path.join(results_dir, f)
         if os.path.exists(path):
             print(f"    - {f}")
