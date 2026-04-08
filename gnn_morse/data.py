@@ -1,9 +1,12 @@
-import os
 import numpy as np
 import torch
 import ase.io
+from ase import Atoms
+from ase.neighborlist import neighbor_list
 from itertools import combinations_with_replacement
 from scipy.spatial.distance import cdist
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import argrelmax, argrelmin
 from torch_geometric.data import Data
 
 from .utils import (
@@ -94,7 +97,90 @@ def read_lammps_dump(filepath, first_n=None):
     return atom_symbols, positions_list, forces_list
 
 
+#  RDF-based cutoff detection
 
+def compute_rdf_cutoff(frame_data, symbols, elem_a, elem_b,
+                       r_max_ang=8.0, bin_width_ang=0.05,
+                       sigma=2.0, stride=10, min_peak_height=0.1,
+                       threshold_frac=0.02):
+#Find first shell cutoff using RDF. After first peak, find minima. Minima threshold is 2% of max peak height.
+    symbols_arr = np.array(symbols)
+    idx_a = np.where(symbols_arr == elem_a)[0]
+    idx_b = np.where(symbols_arr == elem_b)[0]
+
+    if len(idx_a) == 0 or len(idx_b) == 0:
+        return None
+
+    same_species = (elem_a == elem_b)
+    n_bins = int(r_max_ang / bin_width_ang)
+    r_edges_ang = np.linspace(0, r_max_ang, n_bins + 1)
+    r_centers_ang = 0.5 * (r_edges_ang[:-1] + r_edges_ang[1:])
+    hist = np.zeros(n_bins, dtype=np.float64)
+    n_frames_used = 0
+
+    for fi in range(0, len(frame_data), max(1, stride)):
+        _, pos_bohr = frame_data[fi]
+        pos_ang = np.asarray(pos_bohr) * BOHR_TO_ANGSTROM
+
+        dists = cdist(pos_ang[idx_a], pos_ang[idx_b]).ravel()
+        if same_species:
+            dists = dists[dists > 0.01]
+
+        hist += np.histogram(dists, bins=r_edges_ang)[0]
+        n_frames_used += 1
+
+    if n_frames_used == 0 or hist.sum() == 0:
+        return None
+
+    # Smooth
+    smoothed = gaussian_filter1d(hist.astype(np.float64), sigma=sigma)
+
+    # Normalize so max = 1
+    max_val = smoothed.max()
+    if max_val <= 0:
+        return None
+    smoothed_norm = smoothed / max_val
+
+    # Find peaks
+    peak_idx = argrelmax(smoothed_norm, order=3)[0]
+    peak_idx = peak_idx[smoothed_norm[peak_idx] > min_peak_height]
+
+    if len(peak_idx) == 0:
+        return None
+
+    first_peak = peak_idx[0]
+    peak_height = smoothed_norm[first_peak]
+
+    #find where the RDF drops below a threshold after the first peak.
+    drop_threshold = peak_height * threshold_frac
+
+    #find where smoothed drops below threshold after peak
+    after_peak = smoothed_norm[first_peak:]
+    below_thresh = np.where(after_peak < drop_threshold)[0]
+
+    if len(below_thresh) > 0:
+        cutoff_idx = first_peak + below_thresh[0]
+        cutoff_ang = r_centers_ang[cutoff_idx]
+    else:
+        #look for formal minimum (argrelmin)
+        min_idx = argrelmin(smoothed_norm, order=3)[0]
+        min_after_peak = min_idx[min_idx > first_peak]
+        if len(min_after_peak) == 0:
+            min_idx_wide = argrelmin(smoothed_norm, order=5)[0]
+            min_after_peak = min_idx_wide[min_idx_wide > first_peak]
+        if len(min_after_peak) == 0:
+            return None
+        cutoff_idx = min_after_peak[0]
+        cutoff_ang = r_centers_ang[cutoff_idx]
+
+    peak_ang = r_centers_ang[first_peak]
+    if cutoff_ang <= peak_ang or cutoff_ang > r_max_ang * 0.95:
+        return None
+
+    return cutoff_ang * ANGSTROM_TO_BOHR
+
+#The dreaded "gap detection". In order to find if it is "first shell" or longer, bypassing knn_edges (pseudo-coordination number), it detects if there's a "gap"
+# For example, if I have a max CN of 4, and 4 nearest neighbours are at: 2.30A, 2.32A, 2.34A, 5.32A, then I know the 5.32A is in a different "shell" and wont be counted.
 def detect_gap_cutoff(dist_matrix, max_neighbors=20):
     dists = dist_matrix.copy()
     dists[(dists < 1e-10) | ~np.isfinite(dists)] = np.inf
@@ -117,83 +203,85 @@ def detect_gap_cutoff(dist_matrix, max_neighbors=20):
     finite_cutoffs = cutoffs[np.isfinite(cutoffs)]
     median = float(np.median(finite_cutoffs)) if len(finite_cutoffs) > 0 else float('inf')
 
-    return median, cutoffs
+    return median
 
 
+#  Edge building
 
-def build_knn_edges(positions_bohr, atom_symbols, knn_config):
+def build_knn_edges(positions_bohr, atom_symbols, knn_config,
+                    precomputed_cutoffs=None):
+#Build edges for 1 frame, include all pairs within cutoff using ASE neighbor_list.
     inorganic = set(knn_config['inorganic_elements'])
-    k_cross = knn_config['k_cross']
     max_neighbors = knn_config.get('max_gap_neighbors', 20)
     ligand_cutoff_bohr = knn_config.get('ligand_cutoff', 4.0) * ANGSTROM_TO_BOHR
 
     pos = np.asarray(positions_bohr)
+    pos_ang = pos * BOHR_TO_ANGSTROM
     symbols = np.array(atom_symbols)
 
-    inorg_by_elem = {}
+    inorganic_atom_indices = {}
     for elem in sorted(inorganic):
         mask = symbols == elem
         if mask.any():
-            inorg_by_elem[elem] = np.where(mask)[0]
+            inorganic_atom_indices[elem] = np.where(mask)[0]
     ligand_idx = np.where(~np.isin(symbols, list(inorganic)))[0]
-    inorg_elems = sorted(inorg_by_elem.keys())
+    inorg_elems = sorted(inorganic_atom_indices.keys())
 
     edge_arrays = []
-    gap_cuts_bohr = {}
+    pair_cutoffs_bohr = {}
 
-    def _collect_undirected(global_src, global_tgt):
-        lo = np.minimum(global_src, global_tgt)
-        hi = np.maximum(global_src, global_tgt)
-        edge_arrays.append(np.column_stack([lo, hi]))
-
-    # Cross-species: k nearest within gap cutoff, both directions
+    # Determine per-pair cutoffs (precomputed or gap detection)
     for i, elem_a in enumerate(inorg_elems):
-        for elem_b in inorg_elems[i + 1:]:
-            idx_a, idx_b = inorg_by_elem[elem_a], inorg_by_elem[elem_b]
-            dists = cdist(pos[idx_a], pos[idx_b])
+        for elem_b in inorg_elems[i:]:
+            pair_key = canonical_pair(elem_a, elem_b)
+            if precomputed_cutoffs is not None and pair_key in precomputed_cutoffs:
+                pair_cutoffs_bohr[pair_key] = precomputed_cutoffs[pair_key]
+            else:
+                # Need distance matrix for gap detection (first-frame only)
+                idx_a = inorganic_atom_indices[elem_a]
+                idx_b = inorganic_atom_indices[elem_b]
+                if elem_a == elem_b:
+                    dists = cdist(pos[idx_a], pos[idx_a])
+                    np.fill_diagonal(dists, np.inf)
+                else:
+                    dists = cdist(pos[idx_a], pos[idx_b])
+                pair_cutoffs_bohr[pair_key] = detect_gap_cutoff(dists, max_neighbors)
 
-            cut_ab, _ = detect_gap_cutoff(dists, max_neighbors)
-            cut_ba, _ = detect_gap_cutoff(dists.T, max_neighbors)
-            gap_cut = 0.5 * (cut_ab + cut_ba)
-            gap_cuts_bohr[canonical_pair(elem_a, elem_b)] = gap_cut
-
-            for source_idx, target_idx, d in [(idx_a, idx_b, dists),
-                                               (idx_b, idx_a, dists.T)]:
-                k = min(k_cross, d.shape[1])
-                knn_cols = np.argsort(d, axis=1)[:, :k]
-                knn_dists = np.take_along_axis(d, knn_cols, axis=1)
-                rows, cols = np.where(knn_dists <= gap_cut)
-                if len(rows) > 0:
-                    _collect_undirected(source_idx[rows],
-                                        target_idx[knn_cols[rows, cols]])
-
-    # Same-species: all pairs within gap cutoff (no k limit)
-    for elem in inorg_elems:
-        idx = inorg_by_elem[elem]
-        if len(idx) < 2:
-            continue
-        dists = cdist(pos[idx], pos[idx])
-        np.fill_diagonal(dists, np.inf)
-
-        gap_cut, _ = detect_gap_cutoff(dists, max_neighbors)
-        gap_cuts_bohr[canonical_pair(elem, elem)] = gap_cut
-
-        li, lj = np.where(np.triu(dists <= gap_cut, k=1))
-        if len(li) > 0:
-            edge_arrays.append(np.column_stack([idx[li], idx[lj]]))
-
-    # Inorganic-ligand: fixed distance cutoff
+    # Ligand cutoffs
     if len(ligand_idx) > 0:
-        all_inorg_idx = np.concatenate(list(inorg_by_elem.values()))
-        dists = cdist(pos[all_inorg_idx], pos[ligand_idx])
-        ii, jj = np.where(dists < ligand_cutoff_bohr)
-        if len(ii) > 0:
-            _collect_undirected(all_inorg_idx[ii], ligand_idx[jj])
-
         ligand_elems = sorted(set(symbols[ligand_idx]))
         for ie in inorg_elems:
             for le in ligand_elems:
-                gap_cuts_bohr[canonical_pair(ie, le)] = ligand_cutoff_bohr
+                pair_cutoffs_bohr[canonical_pair(ie, le)] = ligand_cutoff_bohr
+
+    # Determine max cutoff across all pairs for ASE neighbor list
+    max_cutoff_ang = max(c * BOHR_TO_ANGSTROM for c in pair_cutoffs_bohr.values()) if pair_cutoffs_bohr else 7.5
+
+    # Build ASE neighbor list (non-periodic)
+    atoms = Atoms(symbols=list(atom_symbols), positions=pos_ang)
+    i_list, j_list, d_list = neighbor_list('ijd', atoms, max_cutoff_ang,
+                                            self_interaction=False)
+
+    # Convert distances back to Bohr for cutoff comparison
+    d_bohr = d_list / BOHR_TO_ANGSTROM
+
+    # Filter edges by per-pair cutoff
+    for edge_idx in range(len(i_list)):
+        ai, aj = int(i_list[edge_idx]), int(j_list[edge_idx])
+        if ai >= aj:
+            continue  # only keep i < j to avoid duplicates
+        ei, ej = symbols[ai], symbols[aj]
+        pair_key = canonical_pair(ei, ej)
+        cutoff = pair_cutoffs_bohr.get(pair_key)
+        if cutoff is None:
+            continue
+        # Check if this pair type is relevant (inorganic-inorganic or inorganic-ligand)
+        ei_inorg = ei in inorganic
+        ej_inorg = ej in inorganic
+        if not ei_inorg and not ej_inorg:
+            continue  # skip ligand-ligand
+        if d_bohr[edge_idx] <= cutoff:
+            edge_arrays.append(np.array([[ai, aj]]))
 
     # Deduplicate and symmetrize to directed edges
     if edge_arrays:
@@ -203,12 +291,13 @@ def build_knn_edges(positions_bohr, atom_symbols, knn_config):
 
     src = np.concatenate([unique_edges[:, 0], unique_edges[:, 1]]).astype(np.int64)
     tgt = np.concatenate([unique_edges[:, 1], unique_edges[:, 0]]).astype(np.int64)
-    gap_cuts_angstrom = {pair: cut * BOHR_TO_ANGSTROM
-                         for pair, cut in gap_cuts_bohr.items()}
+    pair_cutoffs_angstrom = {pair: cut * BOHR_TO_ANGSTROM
+                             for pair, cut in pair_cutoffs_bohr.items()}
 
-    return src, tgt, gap_cuts_angstrom
+    return src, tgt, pair_cutoffs_angstrom
 
 
+#  DFTDataset
 
 class DFTDataset:
 
@@ -261,19 +350,77 @@ class DFTDataset:
         print(f"\nTotal: {len(self.frame_data)} frames, Elements: {self.elements}")
         print(f"Pairs ({len(self.pair_names)}): {', '.join(self.pair_names)}")
 
+    def _compute_cutoffs(self):
+    #Compute cutoffs for edge building. Inorganic (Cd, Se) use the fist shell cutoff found, ligands use whatever is defined in config (4.0A by default)
+        inorganic = set(self.knn_config['inorganic_elements'])
+        symbols = self.frame_data[0][0]
+        symbols_arr = np.array(symbols)
+        positions_bohr = self.frame_data[0][1]
+        pos = np.asarray(positions_bohr)
+        inorg_elems = sorted(e for e in set(symbols) if e in inorganic)
+        ligand_cutoff_ang = self.knn_config.get('ligand_cutoff', 4.0)
+        ligand_cutoff_bohr = ligand_cutoff_ang * ANGSTROM_TO_BOHR
+        max_neighbors = self.knn_config.get('max_gap_neighbors', 20)
+
+        print(f"\nComputing first-shell gap cutoffs...")
+
+        cutoffs_bohr = {}
+
+        # Inorganic pairs: gap cutoff from first frame distance matrix
+        # (detect_gap_cutoff requires full distance matrix, so cdist stays here)
+        inorganic_atom_indices = {}
+        for elem in inorg_elems:
+            mask = symbols_arr == elem
+            if mask.any():
+                inorganic_atom_indices[elem] = np.where(mask)[0]
+
+        for i, elem_a in enumerate(inorg_elems):
+            for elem_b in inorg_elems[i:]:
+                pair_key = canonical_pair(elem_a, elem_b)
+                idx_a = inorganic_atom_indices[elem_a]
+                idx_b = inorganic_atom_indices[elem_b]
+
+                if elem_a == elem_b:
+                    dists = cdist(pos[idx_a], pos[idx_a])
+                    np.fill_diagonal(dists, np.inf)
+                else:
+                    dists = cdist(pos[idx_a], pos[idx_b])
+
+                gap_cut_bohr = detect_gap_cutoff(dists, max_neighbors)
+                gap_cut_ang = gap_cut_bohr * BOHR_TO_ANGSTROM
+
+                cutoffs_bohr[pair_key] = gap_cut_bohr
+                print(f"  {pair_key}: {gap_cut_ang:.2f} A (1st shell gap)")
+
+        # Inorganic-ligand pairs: fixed cutoff
+        ligand_idx = np.where(~np.isin(symbols_arr, list(inorganic)))[0]
+        if len(ligand_idx) > 0:
+            ligand_elems = sorted(set(symbols_arr[ligand_idx]))
+            for ie in inorg_elems:
+                for le in ligand_elems:
+                    pk = canonical_pair(ie, le)
+                    cutoffs_bohr[pk] = ligand_cutoff_bohr
+                    print(f"  {pk}: {ligand_cutoff_ang:.1f} A (ligand)")
+
+        self.cutoffs_bohr = cutoffs_bohr
+
     def build_graphs(self):
-        print("\nBuilding KNN graphs...", end=" ", flush=True)
+        # Compute stable cutoffs once across all frames
+        self._compute_cutoffs()
+
+        print("\nBuilding graphs...", end=" ", flush=True)
         self.graphs = []
         pair_lookup_t = torch.tensor(self.pair_lookup, dtype=torch.long)
 
-        self.gap_cuts_angstrom = None  # store from first frame
+        # gap_cuts_angstrom used by LAMMPS export for cutoffs
+        self.gap_cuts_angstrom = {pair: cut * BOHR_TO_ANGSTROM
+                                  for pair, cut in self.cutoffs_bohr.items()}
 
         for i, (symbols, positions_bohr) in enumerate(self.frame_data):
-            # KNN edges (numpy, CPU)
-            src, tgt, gap_cuts_ang = build_knn_edges(
-                positions_bohr, symbols, self.knn_config)
-            if self.gap_cuts_angstrom is None:
-                self.gap_cuts_angstrom = gap_cuts_ang
+            # Build edges using precomputed cutoffs
+            src, tgt, _ = build_knn_edges(
+                positions_bohr, symbols, self.knn_config,
+                precomputed_cutoffs=self.cutoffs_bohr)
 
             if len(src) == 0:
                 print(f"\nWarning: frame {i} has 0 edges!")
