@@ -223,8 +223,7 @@ class MorseParameterPredictor(nn.Module):
 class GNNMorseModel(nn.Module):
 
     def __init__(self, num_pairs, num_elements, elements, pair_names,
-                 gnn_config, init_D_e=None, init_k=None, init_r0=None,
-                 cutoff_per_pair=None):
+                 gnn_config, init_D_e=None, init_k=None, init_r0=None):
         super().__init__()
         self.num_pairs = num_pairs
         self.elements = elements
@@ -355,7 +354,3 @@ class GNNMorseModel(nn.Module):
                 batch.element_indices, batch.edge_index, batch.distances
             ).cpu().numpy()
 
-    def apply_frozen_mask(self, frozen_mask):
-        for param in [self.raw_D_e, self.raw_k, self.raw_r0]:
-            if param.grad is not None:
-                param.grad *= frozen_mask
