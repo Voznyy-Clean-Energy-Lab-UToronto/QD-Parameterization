@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.cluster import KMeans
 from torch_scatter import scatter_add
 
 from .utils import (
@@ -63,16 +64,10 @@ class VectorQuantizer(nn.Module):
                 if elem_h.size(0) < n_codes:
                     self.codebook[start + elem_h.size(0):end] = elem_h.mean(dim=0)
             else:
-                # K-means initialization (20 iterations)
-                perm = torch.randperm(elem_h.size(0))[:n_codes]
-                centers = elem_h[perm].clone()
-                for _ in range(20):
-                    dists = torch.cdist(elem_h, centers)
-                    assigns = dists.argmin(dim=1)
-                    for k in range(n_codes):
-                        members = elem_h[assigns == k]
-                        if len(members) > 0:
-                            centers[k] = members.mean(dim=0)
+                km = KMeans(n_clusters=n_codes, n_init=1, max_iter=20)
+                centers = torch.from_numpy(
+                    km.fit(elem_h.cpu().numpy()).cluster_centers_
+                ).to(elem_h)
                 self.codebook[start:end] = centers
 
             self.ema_count[start:end] = 1.0
@@ -96,7 +91,7 @@ class VectorQuantizer(nn.Module):
         atom_types = valid.argmin(dim=1)
         z_q = self.codebook[atom_types]
 
-        # Straight-through estimator: gradients flow through as if quantization didn't happen
+        # Straight-through: forward uses z_q, backward passes gradient to h
         h_q = h + (z_q - h).detach()
 
         # Commitment loss (only for multi-code elements)
@@ -158,32 +153,11 @@ class VectorQuantizer(nn.Module):
             result[elem] = int((probs > 1.0 / (4 * n_codes)).sum().item())
         return result
 
-    @torch.no_grad()
-    def get_codebook_utilization(self):
-        result = {}
-        for elem in self.elements:
-            start = self.elem_offset[elem]
-            n_codes = self.n_codes_per_elem[elem]
-            end = start + n_codes
-            if n_codes <= 1:
-                result[elem] = {'perplexity': 1.0, 'max_codes': 1, 'active': 1}
-                continue
-            counts = self.ema_count[start:end]
-            total = counts.sum()
-            if total < 1e-8:
-                result[elem] = {'perplexity': 0.0, 'max_codes': n_codes, 'active': 0}
-                continue
-            probs = counts / total
-            entropy = -(probs * torch.log(probs + 1e-10)).sum()
-            perplexity = torch.exp(entropy).item()
-            active = int((probs > 1.0 / (4 * n_codes)).sum().item())
-            result[elem] = {'perplexity': perplexity, 'max_codes': n_codes, 'active': active}
-        return result
-
 
 class EnvironmentEncoder(nn.Module):
 
-    def __init__(self, num_elements, embed_dim=16, num_rbf=16, r_max_bohr=7.56):
+    def __init__(self, num_elements, embed_dim=16, num_rbf=8,
+                 r_max_bohr=7.56, num_layers=2):
         super().__init__()
         self.embed_dim = embed_dim
 
@@ -197,41 +171,46 @@ class EnvironmentEncoder(nn.Module):
         self.register_buffer('rbf_centers', centers)
         self.register_buffer('rbf_width', torch.tensor(width, dtype=torch.float64))
 
-        # Distance filter: RBF -> filter weights
-        self.filter_net = nn.Sequential(
-            nn.Linear(num_rbf, embed_dim).double(),
-            nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim).double(),
-        )
+        # Per-layer distance filters: each layer gets its own RBF -> filter weights
+        self.filter_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(num_rbf, embed_dim).double(),
+                nn.SiLU(),
+                nn.Linear(embed_dim, embed_dim).double(),
+            )
+            for _ in range(num_layers)
+        ])
 
     def forward(self, elem_idx, edge_index, distances):
         N = elem_idx.size(0)
         h = self.embed(elem_idx)
 
-        # Gaussian RBF encoding
+        # Gaussian RBF encoding (shared across layers)
         rbf = torch.exp(
             -0.5 * ((distances.unsqueeze(1) - self.rbf_centers) / self.rbf_width) ** 2
         )
 
-        # Message passing: neighbor embedding * distance filter, aggregated at each atom
-        W = self.filter_net(rbf)
+        # Multi-layer message passing with residual connections
         src, tgt = edge_index
-        messages = h[tgt] * W
-        aggregated = scatter_add(messages, src, dim=0, dim_size=N)
+        for filter_net in self.filter_nets:
+            W = filter_net(rbf)
+            messages = h[tgt] * W
+            aggregated = scatter_add(messages, src, dim=0, dim_size=N)
+            h = h + aggregated
 
-        return h + aggregated
+        return h
 
 
 class MorseParameterPredictor(nn.Module):
 
-    def __init__(self, embed_dim=16):
+    def __init__(self, embed_dim=8):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim).double(),
             nn.SiLU(),
             nn.Linear(embed_dim, 3).double(),
         )
-        # Start with zero corrections
+        # Zero-init so GNN starts with zero corrections to base Morse params
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
@@ -244,100 +223,77 @@ class MorseParameterPredictor(nn.Module):
 class GNNMorseModel(nn.Module):
 
     def __init__(self, num_pairs, num_elements, elements, pair_names,
-                 gnn_config, init_D_e=None, init_alpha=None, init_r0=None,
+                 gnn_config, init_D_e=None, init_k=None, init_r0=None,
                  cutoff_per_pair=None):
         super().__init__()
         self.num_pairs = num_pairs
         self.elements = elements
         self.pair_names = pair_names
-        self.use_gnn = gnn_config.get('enabled', True)
 
-        self.vq_enabled = gnn_config.get('vq_enabled', False)
         self.vq_active = False
-
-        # Smooth/linear cutoff per pair type (Bohr).
-        # F(r) = F_morse(r) - F_morse(rc) so force goes to zero at rc.
-        # Matches LAMMPS pair_style morse/smooth/linear.
-        if cutoff_per_pair is not None:
-            self.register_buffer('cutoff_per_pair',
-                torch.tensor(cutoff_per_pair, dtype=torch.float64))
-        else:
-            self.register_buffer('cutoff_per_pair',
-                torch.full((num_pairs,), 1000.0, dtype=torch.float64))
 
         # Default parameter initialization
         if init_D_e is None:
             init_D_e = np.full(num_pairs, 0.1 * EV_TO_HARTREE)
-        if init_alpha is None:
-            init_alpha = np.full(num_pairs, 1.5 * BOHR_TO_ANGSTROM)
+        if init_k is None:
+            init_k = np.full(num_pairs, 2.0 * 0.1 * EV_TO_HARTREE * (1.5 * BOHR_TO_ANGSTROM) ** 2)
         if init_r0 is None:
             init_r0 = np.full(num_pairs, 3.0 * ANGSTROM_TO_BOHR)
 
-        # Base Morse parameters (internal units: Hartree, Bohr)
+        # Pre-softplus values — softplus ensures D_e, k > 0
         self.raw_D_e = nn.Parameter(
             inverse_softplus(torch.tensor(init_D_e, dtype=torch.float64)))
-        self.raw_alpha = nn.Parameter(
-            inverse_softplus(torch.tensor(init_alpha, dtype=torch.float64)))
+        self.raw_k = nn.Parameter(
+            inverse_softplus(torch.tensor(init_k, dtype=torch.float64)))
         self.raw_r0 = nn.Parameter(
             torch.tensor(init_r0, dtype=torch.float64))
 
-        if self.use_gnn:
-            embed_dim = gnn_config.get('embed_dim', 16)
-            num_rbf = gnn_config.get('num_rbf', 16)
-            r_max_bohr = gnn_config.get('r_max_angstroms', 4.0) * ANGSTROM_TO_BOHR
-            self.env_encoder = EnvironmentEncoder(
-                num_elements, embed_dim, num_rbf, r_max_bohr)
-            self.param_predictor = MorseParameterPredictor(embed_dim)
+        embed_dim = gnn_config.get('embed_dim', 16)
+        num_rbf = gnn_config.get('num_rbf', 8)
+        num_layers = gnn_config.get('num_layers', 2)
+        r_max_bohr = gnn_config.get('r_max_angstroms', 4.0) * ANGSTROM_TO_BOHR
+        self.env_encoder = EnvironmentEncoder(
+            num_elements, embed_dim, num_rbf, r_max_bohr, num_layers)
+        self.param_predictor = MorseParameterPredictor(embed_dim)
 
-            if self.vq_enabled:
-                self.vq = VectorQuantizer(
-                    elements=elements,
-                    embed_dim=embed_dim,
-                    max_codes_per_element=gnn_config.get('vq_max_codes', 4),
-                    core_elements=gnn_config.get('core_elements'),
-                    ema_decay=gnn_config.get('vq_ema_decay', 0.99),
-                    commitment_weight=gnn_config.get('vq_commitment_weight', 0.25),
-                )
-
+        self.vq = VectorQuantizer(
+            elements=elements,
+            embed_dim=embed_dim,
+            max_codes_per_element=gnn_config.get('vq_max_codes', 4),
+            core_elements=gnn_config.get('core_elements'),
+            ema_decay=gnn_config.get('vq_ema_decay', 0.99),
+            commitment_weight=gnn_config.get('vq_commitment_weight', 0.25),
+        )
+    #VQ-VAE has no decoder, subtypes are all learned through force loss
     def _compute_corrected_params(self, batch):
         raw_D = self.raw_D_e[batch.pair_indices]
-        raw_a = self.raw_alpha[batch.pair_indices]
+        raw_k = self.raw_k[batch.pair_indices]
         raw_r0 = self.raw_r0[batch.pair_indices]
         vq_loss = torch.tensor(0.0, device=raw_D.device, dtype=raw_D.dtype)
 
-        if self.use_gnn:
-            h = self.env_encoder(
-                batch.element_indices, batch.edge_index, batch.distances)
+        h = self.env_encoder(
+            batch.element_indices, batch.edge_index, batch.distances)
 
-            if self.vq_enabled and self.vq_active:
-                h, self._last_atom_types, vq_loss = self.vq(h, batch.element_indices)
+        if self.vq_active:
+            h, _, vq_loss = self.vq(h, batch.element_indices)
 
-            corrections = self.param_predictor(h, batch.edge_index)
-            D_e = nn.functional.softplus(raw_D + corrections[:, 0])
-            alpha = nn.functional.softplus(raw_a + corrections[:, 1])
-            r0 = raw_r0 + corrections[:, 2]
-        else:
-            D_e = nn.functional.softplus(raw_D)
-            alpha = nn.functional.softplus(raw_a)
-            r0 = raw_r0
+        corrections = self.param_predictor(h, batch.edge_index)
+        D_e = nn.functional.softplus(raw_D + corrections[:, 0])
+        k = nn.functional.softplus(raw_k + corrections[:, 1])
+        r0 = raw_r0 + corrections[:, 2]
+
+        # alpha = sqrt(k / (2*D_e))  from Morse spring constant k = 2*D_e*alpha^2
+        alpha = torch.sqrt(k / (2.0 * D_e))
 
         return D_e, alpha, r0, vq_loss
 
     def forward(self, batch):
         D_e, alpha, r0, vq_loss = self._compute_corrected_params(batch)
 
-        # Morse potential: V(r) = D_e * (1 - exp(-alpha*(r-r0)))^2
+        # Morse force: f(r) = 2*D_e*alpha*(exp(-2a(r-r0)) - exp(-a(r-r0)))
         x = batch.distances - r0
         exp_term = torch.exp(-alpha * x)
-        scalar_force = 2.0 * D_e * alpha * (exp_term ** 2 - exp_term)  # -dV/dr
-
-        # Smooth/linear correction: F(r) = F_morse(r) - F_morse(rc)
-        # Matches LAMMPS pair_style morse/smooth/linear
-        rc = self.cutoff_per_pair[batch.pair_indices]
-        x_c = rc - r0
-        exp_c = torch.exp(-alpha * x_c)
-        force_at_cutoff = 2.0 * D_e * alpha * (exp_c ** 2 - exp_c)
-        scalar_force = scalar_force - force_at_cutoff
+        scalar_force = 2.0 * D_e * alpha * (exp_term ** 2 - exp_term)
 
         # Accumulate forces on atoms
         force_vectors = -scalar_force.unsqueeze(1) * batch.edge_unit_vectors
@@ -350,24 +306,30 @@ class GNNMorseModel(nn.Module):
     def get_per_edge_params(self, batch):
         with torch.no_grad():
             D_e, alpha, r0, _ = self._compute_corrected_params(batch)
+        D_e_ev = D_e.cpu().numpy() * HARTREE_TO_EV
+        alpha_inv_ang = alpha.cpu().numpy() / BOHR_TO_ANGSTROM
+        r0_ang = r0.cpu().numpy() * BOHR_TO_ANGSTROM
         return {
-            'D_e': D_e.cpu().numpy() * HARTREE_TO_EV,
-            'alpha': alpha.cpu().numpy() / BOHR_TO_ANGSTROM,
-            'r0': r0.cpu().numpy() * BOHR_TO_ANGSTROM,
+            'D_e': D_e_ev,
+            'alpha': alpha_inv_ang,
+            'r0': r0_ang,
+            'k': 2.0 * D_e_ev * alpha_inv_ang ** 2,
         }
 
     def get_base_params_display(self):
         D_e = nn.functional.softplus(self.raw_D_e).detach().cpu().numpy()
-        alpha = nn.functional.softplus(self.raw_alpha).detach().cpu().numpy()
+        k = nn.functional.softplus(self.raw_k).detach().cpu().numpy()
         r0 = self.raw_r0.detach().cpu().numpy()
+        alpha = np.sqrt(k / (2.0 * D_e))
         return {
             'D_e': D_e * HARTREE_TO_EV,
             'alpha': alpha / BOHR_TO_ANGSTROM,
             'r0': r0 * BOHR_TO_ANGSTROM,
+            'k': k * HARTREE_TO_EV / BOHR_TO_ANGSTROM ** 2,
         }
 
     def get_atom_types(self, batch):
-        if not (self.vq_enabled and self.vq_active and self.use_gnn):
+        if not self.vq_active:
             return None
         with torch.no_grad():
             h = self.env_encoder(
@@ -380,18 +342,20 @@ class GNNMorseModel(nn.Module):
                 elem = self.elements[ei]
                 code_idx = atom_type_indices[i].item()
                 local_code = code_idx - self.vq.elem_offset[elem]
-                type_names.append(f"{elem}_{local_code}")
+                # Only add code suffix for multi-code elements
+                if self.vq.n_codes_per_elem[elem] > 1:
+                    type_names.append(f"{elem}_{local_code}")
+                else:
+                    type_names.append(elem)
             return atom_type_indices.cpu().numpy(), type_names
 
     def get_embeddings(self, batch):
         with torch.no_grad():
-            if self.use_gnn:
-                return self.env_encoder(
-                    batch.element_indices, batch.edge_index, batch.distances
-                ).cpu().numpy()
-            return None
+            return self.env_encoder(
+                batch.element_indices, batch.edge_index, batch.distances
+            ).cpu().numpy()
 
     def apply_frozen_mask(self, frozen_mask):
-        for param in [self.raw_D_e, self.raw_alpha, self.raw_r0]:
+        for param in [self.raw_D_e, self.raw_k, self.raw_r0]:
             if param.grad is not None:
                 param.grad *= frozen_mask
