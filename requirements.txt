@@ -1,24 +1,6 @@
-# SW fitter v9 dependencies. Verified working with Python 3.11 on macOS (CPU torch).
-# Install into a fresh environment, e.g.:
-#   conda create -n sw_fitter python=3.11 && conda activate sw_fitter
-#   pip install -r requirements.txt
-
-# --- core scientific stack ---
 numpy==1.26.4
 scipy==1.16.3
-ase==3.27.0          # trajectory I/O (extxyz, lammps-dump), units, neighbor lists
-PyYAML==6.0.3        # config files
-matplotlib==3.10.8   # training / force-parity plots
-
-# --- deep learning ---
+ase==3.27.0
+PyYAML==6.0.3
+matplotlib==3.10.8
 torch==2.7.1
-
-# --- PyTorch Geometric stack ---
-# torch_scatter ships as compiled wheels that MUST match your torch version and
-# platform (CPU vs CUDA). Plain `pip install torch_scatter` often fails to build.
-# If the lines below don't resolve, install from the PyG wheel index first:
-#   pip install torch_scatter==2.1.2 torch_geometric==2.6.1 \
-#       -f https://data.pyg.org/whl/torch-2.7.1+cpu.html
-# (swap +cpu for e.g. +cu121 if you are on CUDA).
-torch_scatter==2.1.2
-torch_geometric==2.6.1
