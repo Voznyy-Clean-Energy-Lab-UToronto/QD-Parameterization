@@ -1,60 +1,55 @@
-"""Plotting: training curves, force parity, force residuals."""
-import os
-import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+import numpy as np
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
 import torch
-from torch_geometric.loader import DataLoader
+from matplotlib.colors import LogNorm
+
+from .data import make_batch
+from .models import sw_forces
 from .utils import FORCE_AU_TO_EV_ANG
 
 
-def collect_forces(model, dataset, device):
-    model.eval()
-    loader = DataLoader(dataset.graphs, batch_size=16, shuffle=False)
-    pred_all, ref_all, elem_all = [], [], []
-    with torch.no_grad():
-        for batch in loader:
-            if device.type != 'cuda':
-                batch = batch.to(device)
-            forces = model(batch)
-            pred_all.append(forces.cpu().numpy() * FORCE_AU_TO_EV_ANG)
-            ref_all.append(batch.dft_forces.cpu().numpy() * FORCE_AU_TO_EV_ANG)
-            elem_all.append(batch.element_indices.cpu().numpy())
-    return np.concatenate(pred_all), np.concatenate(ref_all), np.concatenate(elem_all)
-
-
-def plot_training(train_hist, val_hist, filepath):
+def plot_training(train_history, val_history, filepath):
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(range(1, len(train_hist)+1), train_hist, 'b-', label='Train', alpha=0.8)
-    if val_hist:
-        ax.plot(range(1, len(val_hist)+1), val_hist, 'r-', label='Val', alpha=0.8)
-    ax.set_xlabel('Epoch'); ax.set_ylabel('Force RMSE (eV/A)')
-    ax.set_title(f'Best val = {min(val_hist):.4f}')
-    ax.legend(); ax.grid(True, alpha=0.3)
-    plt.tight_layout(); plt.savefig(filepath, dpi=150); plt.close()
+    ax.plot(range(1, len(train_history) + 1), train_history, label="train")
+    ax.plot(range(1, len(val_history) + 1), val_history, label="validation")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("force RMSE (eV/Angstrom)")
+    ax.set_title(f"best validation RMSE = {min(val_history):.4f} eV/Angstrom")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(filepath, dpi=150)
+    plt.close(fig)
 
 
-def plot_force_parity(model, dataset, device, filepath):
-    pred, ref, _ = collect_forces(model, dataset, device)
-    rmse = np.sqrt(np.mean((pred.ravel() - ref.ravel())**2))
+def plot_force_parity(dataset, params, filepath):
+    predicted_chunks, target_chunks = [], []
+    with torch.no_grad():
+        for start in range(0, len(dataset.graphs), 16):
+            batch = make_batch(
+                dataset.graphs[start : start + 16], dataset.atoms_per_frame
+            )
+            mask = batch["fit_mask"]
+            predicted_chunks.append(sw_forces(batch, params)[mask].numpy())
+            target_chunks.append(batch["dft_forces"][mask].numpy())
+
+    predicted = np.concatenate(predicted_chunks).ravel() * FORCE_AU_TO_EV_ANG
+    target = np.concatenate(target_chunks).ravel() * FORCE_AU_TO_EV_ANG
+    rmse = np.sqrt(np.mean((predicted - target) ** 2))
+
     fig, ax = plt.subplots(figsize=(7, 7))
-    ax.hexbin(ref.ravel(), pred.ravel(), gridsize=80, mincnt=1, cmap='viridis', norm=LogNorm())
-    lim = np.percentile(np.abs(np.concatenate([ref.ravel(), pred.ravel()])), 99.5) * 1.1
-    ax.plot([-lim, lim], [-lim, lim], 'r--', lw=1)
-    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
-    ax.set_xlabel('DFT (eV/A)'); ax.set_ylabel('Predicted (eV/A)')
-    ax.set_title(f'RMSE = {rmse:.4f} eV/A'); ax.set_aspect('equal')
-    plt.tight_layout(); plt.savefig(filepath, dpi=150); plt.close()
-
-
-def generate_all_plots(model, dataset, device, train_hist=None, val_hist=None, output_dir='.'):
-    os.makedirs(output_dir, exist_ok=True)
-    if train_hist:
-        plot_training(train_hist, val_hist or [], os.path.join(output_dir, 'training_curves.png'))
-    try:
-        plot_force_parity(model, dataset, device, os.path.join(output_dir, 'force_parity.png'))
-    except Exception as e:
-        print(f'  Force parity plot failed: {e}')
-    print(f'  Plots: {output_dir}/')
+    ax.hexbin(target, predicted, gridsize=80, mincnt=1, cmap="viridis", norm=LogNorm())
+    limit = np.percentile(np.abs(np.concatenate([target, predicted])), 99.5) * 1.1
+    ax.plot([-limit, limit], [-limit, limit], "r--", lw=1)
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_aspect("equal")
+    ax.set_xlabel("DFT force (eV/Angstrom)")
+    ax.set_ylabel("SW force (eV/Angstrom)")
+    ax.set_title(f"force parity, RMSE = {rmse:.4f} eV/Angstrom")
+    fig.tight_layout()
+    fig.savefig(filepath, dpi=150)
+    plt.close(fig)
