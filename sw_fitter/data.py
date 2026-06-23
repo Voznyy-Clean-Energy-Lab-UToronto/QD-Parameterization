@@ -25,12 +25,6 @@ INORGANIC = {"Cd", "Se"}  # the framework elements; C/H/O are ligand atoms
 
 #  Loading
 def read_trajectory(filepath, fmt="extxyz", first_n=None, skip_n=None):
-    """Read a trajectory; return (symbols, positions_bohr, forces_au).
-
-    positions is a list of (n_atoms, 3) arrays in Bohr, one per frame; forces is the
-    same in atomic units, or a list of Nones if the file carries no forces. A quantum
-    dot is non-periodic, so there is no simulation cell to track.
-    """
     ase_format = "lammps-dump-text" if fmt == "lammps" else "extxyz"
     frames = ase.io.read(filepath, index=":", format=ase_format)
     if skip_n:
@@ -56,7 +50,6 @@ def read_trajectory(filepath, fmt="extxyz", first_n=None, skip_n=None):
 
 
 def is_scoped_pair(element_a, element_b):
-    """SW acts only on the framework: Cd-Se bonds and metal-O (ligand) bonds."""
     cd_se_bond = element_a in INORGANIC and element_b in INORGANIC and element_a != element_b
     metal_oxygen_bond = ((element_a in INORGANIC and element_b == "O")
                          or (element_b in INORGANIC and element_a == "O"))
@@ -129,8 +122,6 @@ def measure_pair_scales(sampled_positions_bohr, symbols, elements):
 
 
 def enumerate_triplet_types(elements, scoped_bonds):
-    """List the triplet types we parameterize: a Cd/Se centre and two legs that are
-    each scoped bonds with that centre. e.g. 'Cd:Se-Se'."""
     names = set()
     for centre in elements:
         if centre not in INORGANIC:
