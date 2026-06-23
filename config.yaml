@@ -1,26 +1,13 @@
-# SW fitter config used by consistency_check.py (paths are repo-relative; the check
-# prepends the repo root). Real fit configs live in the per-run output directories.
-
 datasets:
-- name: Cd68Se55_650K
-  xyz: runs/data/Cd68Se55_650K.extxyz
-  skip_frames: 500
-  first_n_frames: 2000
-
-knn_edges:
-  inorganic_elements: [Cd, Se]
-  shell: 1
-  max_cutoff: 8.0
-  max_gap_neighbors: 40
-  ligand_cutoff: 4.0
-  subtype_ligand_cutoff: 3.0
-  subtype_inorganic_cutoff: 3.5
-  k_threshold: 0.5
+  - name: Cd68Se55_650K
+    xyz: path/to/run/QD.extxyz
+    skip_frames: 500 #skip equilibrium frames
+    first_n_frames: 2000
 
 training:
-  learning_rate: 0.01
+  learning_rate: 0.02
   batch_size: 64
-  convergence_patience: 60
+  convergence_patience: 40
   convergence_threshold: 0.0001
   validation_split: 0.15
-  training_temperature: 650
+  training_temperature: 650 #K
