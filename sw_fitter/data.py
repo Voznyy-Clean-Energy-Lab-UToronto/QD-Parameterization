@@ -17,17 +17,13 @@ from .utils import (
     canonical_triplet,
 )
 
-# SW shape parameters — fixed from Zhou et al. (PRB 88, 085309, 2013).
-# Only sigma (derived from r0) and cutoff (from CUTOFF_RATIO) are measured per bond.
-ZHOU_B = 1.116149    # initial B — will be optimized per bond
+ZHOU_B = 1.116149    # initial B 
 SIGMA_RATIO = 1.28094    # r0 / sigma  (location of V2 minimum)
 CUTOFF_RATIO = 1.953387  # cutoff / sigma  (SW 'a' parameter)
 P = 4.0  # (sigma/r)^p exponent
 
 BOLTZMANN_EV = 8.617333e-5  # eV/K
 
-# First-shell search window. 5.5 Å captures both Cd-Se (~2.7 Å) and
-# same-species second-neighbours Cd-Cd / Se-Se (~4.3-4.5 Å).
 BOND_MAX_ANG = 5.5
 
 INORGANIC = {"Cd", "Se"}
@@ -55,11 +51,6 @@ def read_trajectory(filepath, fmt="extxyz", first_n=None, skip_n=None):
 
 
 def is_scoped_pair(element_a, element_b):
-    """
-    Include all inorganic-inorganic pairs (Cd-Cd, Se-Se, Cd-Se)
-    and inorganic-oxygen pairs (Cd-O, Se-O).
-    Organic atoms (C, H) are handled by LAMMPS CHARMM; not fitted here.
-    """
     both_inorganic = element_a in INORGANIC and element_b in INORGANIC
     inorganic_O = (element_a in INORGANIC and element_b == "O") or (
         element_b in INORGANIC and element_a == "O"
@@ -68,7 +59,6 @@ def is_scoped_pair(element_a, element_b):
 
 
 def _compute_A_from_B_scalar(B, sigma, r0, cutoff):
-    """Scalar version (plain floats) for use in data.py geometry routines."""
     bracket = B * (sigma / r0) ** P - 1.0
     decay = math.exp(sigma / (r0 - cutoff))
     return -1.0 / (bracket * decay)
@@ -81,7 +71,6 @@ def _v2_scalar(r, eps, A, B, sigma, cutoff):
 
 
 def _d2v2_shape_factor(B, sigma, r0, cutoff, dr=1e-5):
-    """d²V2/dr² at r0 with eps=1.0, A derived from B. Units: (energy unit)/Bohr²."""
     A = _compute_A_from_B_scalar(B, sigma, r0, cutoff)
     v_p = _v2_scalar(r0 + dr, 1.0, A, B, sigma, cutoff)
     v_m = _v2_scalar(r0 - dr, 1.0, A, B, sigma, cutoff)
@@ -90,13 +79,6 @@ def _d2v2_shape_factor(B, sigma, r0, cutoff, dr=1e-5):
 
 
 def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_element, temperature):
-    """
-    Measure r0 (RDF peak), first_minimum, mean coordination, and bond-length variance
-    from a sample of DFT positions.
-
-    Returns (r0_bohr, first_min_bohr, coordination, var_r_bohr_sq)
-    or None if no clear first-shell peak is found.
-    """
     bond_max_bohr = BOND_MAX_ANG * ANGSTROM_TO_BOHR
     bin_edges = np.linspace(1.5 * ANGSTROM_TO_BOHR, bond_max_bohr, 100)
     bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -118,7 +100,6 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
 
     r0_bohr = float(bin_centres[np.argmax(g)])
 
-    # First minimum: look after the peak up to +2 Å
     after_peak = (bin_centres > r0_bohr) & (bin_centres < r0_bohr + 2.0 * ANGSTROM_TO_BOHR)
     if after_peak.sum() < 2:
         return None
@@ -126,7 +107,6 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
 
     coordination = coordination / len(sampled_positions_bohr)
 
-    # Variance of first-shell bond lengths (up to the first minimum)
     shell_dists = []
     for positions in sampled_positions_bohr:
         distances = cdist(positions[atoms_a], positions[atoms_b])
@@ -141,14 +121,6 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
 
 
 def measure_pair_scales(sampled_positions_bohr, symbols, elements, temperature):
-    """
-    For each scoped bond pair: measure r0 from RDF, derive sigma and cutoff,
-    and estimate eps_init from the bond-length variance via equipartition.
-
-    eps_init = kT / Var(r) / (d²V2/dr²|_r0 with eps=1)
-
-    Returns a scales dict with keys: r0, sigma, cutoff, B_init, eps_init.
-    """
     symbols = np.array(symbols)
     atoms_of_element = {e: np.where(symbols == e)[0] for e in elements}
 
