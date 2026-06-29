@@ -4,48 +4,74 @@ import torch
 
 from .utils import canonical_pair
 
-P = 4.0  # the (sigma/r)^p exponent
-GAMMA = 1.20  # the 3-body exponential decay
-# (q = 0, so the second 2-body term (sigma/r)^q is just the constant 1
+P = 4.0       # (sigma/r)^p exponent — fixed from SW literature
+GAMMA = 1.20  # 3-body exponential decay coefficient
+Q = 0.0       # second 2-body exponent
+
+SIGMA_RATIO = 1.28094    # r0 / sigma  (location of V2 minimum in standard SW)
+CUTOFF_RATIO = 1.953387  # cutoff / sigma  (the LAMMPS 'a' parameter)
 
 
-def sw_2body_force(bond_length, eps, sigma, A, B, cutoff):
+def rmin_from_raw(raw_rmin, sigma, cutoff):
+    return sigma + (cutoff - sigma) * torch.sigmoid(raw_rmin)
+
+
+def B_from_rmin(r_min, sigma, cutoff):
+    ratio4 = (r_min / sigma) ** P
+    denom = 1.0 + 4.0 * (r_min - cutoff) ** 2 / (sigma * r_min)
+    return ratio4 / denom
+
+
+def A_from_rmin(r_min, sigma, cutoff):
+    B = B_from_rmin(r_min, sigma, cutoff)
+    bracket_at_rmin = B * (sigma / r_min) ** P - 1.0  # always < 0
+    decay_at_rmin = torch.exp(sigma / (r_min - cutoff))  # r_min < cutoff so exponent < 0
+    return -1.0 / (bracket_at_rmin * decay_at_rmin)  # always > 0
+
+
+def A_from_rmin_float(r_min, sigma, cutoff):
+    B = B_from_rmin(r_min, sigma, cutoff)
+    bracket_at_rmin = B * (sigma / r_min) ** P - 1.0
+    decay_at_rmin = math.exp(sigma / (r_min - cutoff))
+    return -1.0 / (bracket_at_rmin * decay_at_rmin)
+
+
+def sw_2body_force(bond_length, eps, raw_rmin, sigma, cutoff):
+    r_min = rmin_from_raw(raw_rmin, sigma, cutoff)
+    B = B_from_rmin(r_min, sigma, cutoff)
+    A = A_from_rmin(r_min, sigma, cutoff)
     sigma_over_r = sigma / bond_length
-    bracket = B * sigma_over_r**P - 1.0  # the ( B(sigma/r)^4 - 1 ) factor
-    d_bracket = P * B * sigma_over_r**P / bond_length  # = -d(bracket)/dr
-    inv_gap = 1.0 / (bond_length - cutoff)  # 1/(r - cutoff); negative inside cutoff
-    decay = torch.exp(sigma * inv_gap)  # the exp( sigma/(r-cutoff) ) cutoff factor
-    return A * eps * decay * (d_bracket + bracket * sigma * inv_gap**2)
+    bracket = B * sigma_over_r ** P - 1.0
+    d_bracket = P * B * sigma_over_r ** P / bond_length
+    inv_gap = 1.0 / (bond_length - cutoff)
+    decay = torch.exp(sigma * inv_gap)
+    return A * eps * decay * (d_bracket + bracket * sigma * inv_gap ** 2)
 
 
 def sw_3body_forces(
-    vec_ca,
-    vec_cb,
-    strength,
-    cos_theta0,
-    gamma_sigma_ca,
-    gamma_sigma_cb,
-    cutoff_ca,
-    cutoff_cb,
+    vec_ca, vec_cb,
+    strength, cos_theta0,
+    gamma_sigma_ca, gamma_sigma_cb,
+    cutoff_ca, cutoff_cb,
 ):
     length_ca = vec_ca.norm(dim=1)
     length_cb = vec_cb.norm(dim=1)
     cos_theta = (vec_ca * vec_cb).sum(dim=1) / (length_ca * length_cb)
 
-    gap_ca = (length_ca - cutoff_ca).clamp(max=-1e-9)  # negative inside the cutoff
+    gap_ca = (length_ca - cutoff_ca).clamp(max=-1e-9)
     gap_cb = (length_cb - cutoff_cb).clamp(max=-1e-9)
     decay_ca = torch.exp(gamma_sigma_ca / gap_ca)
     decay_cb = torch.exp(gamma_sigma_cb / gap_cb)
-    energy_scale = strength * decay_ca * decay_cb  # everything except the angle term
+    energy_scale = strength * decay_ca * decay_cb
 
     angle_term = cos_theta - cos_theta0
-    radial = energy_scale * angle_term**2  # the part that pushes along the bonds
-    angular = 2.0 * energy_scale * angle_term  # the part that opens/closes the angle
+    radial = energy_scale * angle_term ** 2
+    angular = 2.0 * energy_scale * angle_term
 
-    decay_slope_ca = gamma_sigma_ca / gap_ca**2 / length_ca
-    decay_slope_cb = gamma_sigma_cb / gap_cb**2 / length_cb
-    cos_over_lensq_ca = cos_theta / length_ca**2
-    cos_over_lensq_cb = cos_theta / length_cb**2
+    decay_slope_ca = gamma_sigma_ca / gap_ca ** 2 / length_ca
+    decay_slope_cb = gamma_sigma_cb / gap_cb ** 2 / length_cb
+    cos_over_lensq_ca = cos_theta / length_ca ** 2
+    cos_over_lensq_cb = cos_theta / length_cb ** 2
     cross = 1.0 / (length_ca * length_cb)
 
     along_ca = radial * decay_slope_ca + angular * cos_over_lensq_ca
@@ -58,48 +84,47 @@ def sw_3body_forces(
 
 
 def two_body_forces(positions, edges_by_type, params):
-    eps, sigma = params["eps"], params["sigma"]
-    A, B, cutoff = params["A"], params["B"], params["cutoff"]
+    eps = params["eps"]
+    raw_rmin = params["raw_rmin"]
+    sigma, cutoff = params["sigma"], params["cutoff"]
     forces = torch.zeros_like(positions)
     for bond in edges_by_type:
         atom_i, atom_j = edges_by_type[bond]
         bond_vector = positions[atom_j] - positions[atom_i]
         bond_length = bond_vector.norm(dim=1)
         force_magnitude = sw_2body_force(
-            bond_length, eps[bond], sigma[bond], A[bond], B[bond], cutoff[bond]
+            bond_length, eps[bond], raw_rmin[bond], sigma[bond], cutoff[bond]
         )
         bond_force = (force_magnitude / bond_length).unsqueeze(1) * bond_vector
-        # index_add(dim, indices, values) adds 'values' onto the rows named by 'indices'.
-        forces = forces.index_add(
-            0, atom_i, -bond_force
-        )  # Newton's third law: atom i and
-        forces = forces.index_add(
-            0, atom_j, bond_force
-        )  # atom j feel equal, opposite forces
+        forces = forces.index_add(0, atom_i, -bond_force)
+        forces = forces.index_add(0, atom_j, bond_force)
     return forces
 
 
 def three_body_forces(positions, triplets_by_type, params):
-    sigma, cutoff, strength_of = params["sigma"], params["cutoff"], params["L"]
-    cos_theta0_of = params["cos_theta0"]
+    sigma = params["sigma"]
+    cutoff = params["cutoff"]
+    raw_lam = params["raw_lam"]
+    raw_theta0 = params["raw_theta0"]
     forces = torch.zeros_like(positions)
     for triplet_name in triplets_by_type:
         centre_idx, a_idx, b_idx = triplets_by_type[triplet_name]
-        # the triplet name encodes the centre and its two leg bonds, e.g.
-        # 'Cd_core:Se_core-Se_surf' -> centre Cd_core, legs Cd_core-Se_core, Cd_core-Se_surf
         centre, legs = triplet_name.split(":")
-        leg_a_subtype, leg_b_subtype = legs.split("-")
-        bond_ca = canonical_pair(centre, leg_a_subtype)
-        bond_cb = canonical_pair(centre, leg_b_subtype)
-        strength = math.sqrt(
-            strength_of[bond_ca] * strength_of[bond_cb]
-        )  # Zhou lambda*eps mixing
+        leg_a, leg_b = legs.split("-")
+        bond_ca = canonical_pair(centre, leg_a)
+        bond_cb = canonical_pair(centre, leg_b)
+
+        lam_ca = torch.exp(raw_lam[bond_ca])
+        lam_cb = torch.exp(raw_lam[bond_cb])
+        strength = torch.sqrt(lam_ca * lam_cb)
+
+        cos_theta0 = torch.tanh(raw_theta0[triplet_name])
 
         force_a, force_b = sw_3body_forces(
             positions[a_idx] - positions[centre_idx],
             positions[b_idx] - positions[centre_idx],
             strength,
-            cos_theta0_of[triplet_name],
+            cos_theta0,
             GAMMA * sigma[bond_ca],
             GAMMA * sigma[bond_cb],
             cutoff[bond_ca],
