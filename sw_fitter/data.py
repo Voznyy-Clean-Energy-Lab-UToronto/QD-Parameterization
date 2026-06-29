@@ -1,3 +1,4 @@
+import math
 from collections import Counter
 from itertools import combinations, combinations_with_replacement
 
@@ -16,19 +17,22 @@ from .utils import (
     canonical_triplet,
 )
 
-# The II-VI Stillinger-Weber 2-body shape (Zhou et al., PRB 88, 085309, 2013).
-# These are dimensionless and FIXED; only the measured bond length r0 sets the
-# physical scale, through  sigma = r0 / SIGMA_RATIO.
-ZHOU_A = 7.0496  # 2-body prefactor A
-ZHOU_B = 1.116149  # 2-body coefficient B
-SIGMA_RATIO = 1.28094  # r0 / sigma   (where the SW well sits)
-CUTOFF_RATIO = 1.953387  # cutoff / sigma   (the SW parameter 'a')
+# SW shape parameters — fixed from Zhou et al. (PRB 88, 085309, 2013).
+# Only sigma (derived from r0) and cutoff (from CUTOFF_RATIO) are measured per bond.
+ZHOU_B = 1.116149    # initial B — will be optimized per bond
+SIGMA_RATIO = 1.28094    # r0 / sigma  (location of V2 minimum)
+CUTOFF_RATIO = 1.953387  # cutoff / sigma  (SW 'a' parameter)
+P = 4.0  # (sigma/r)^p exponent
 
-BOND_MAX_ANG = 3.3  # a true first-neighbour bond is shorter than this (Angstrom)
-INORGANIC = {"Cd", "Se"}  # the framework elements; C/H/O are ligand atoms
+BOLTZMANN_EV = 8.617333e-5  # eV/K
+
+# First-shell search window. 5.5 Å captures both Cd-Se (~2.7 Å) and
+# same-species second-neighbours Cd-Cd / Se-Se (~4.3-4.5 Å).
+BOND_MAX_ANG = 5.5
+
+INORGANIC = {"Cd", "Se"}
 
 
-#  Loading
 def read_trajectory(filepath, fmt="extxyz", first_n=None, skip_n=None):
     ase_format = "lammps-dump-text" if fmt == "lammps" else "extxyz"
     frames = ase.io.read(filepath, index=":", format=ase_format)
@@ -38,108 +42,167 @@ def read_trajectory(filepath, fmt="extxyz", first_n=None, skip_n=None):
         frames = frames[:first_n]
 
     symbols = frames[0].get_chemical_symbols()
-    positions = []
-    forces = []
+    positions, forces = [], []
     for frame in frames:
         positions.append(frame.positions * ANGSTROM_TO_BOHR)
         frame_forces = frame.arrays.get("forces")
         if frame_forces is None and frame.calc is not None:
             frame_forces = frame.calc.results.get("forces")
-        if frame_forces is None:
-            forces.append(None)
-        else:
-            forces.append(frame_forces / FORCE_AU_TO_EV_ANG)
+        forces.append(frame_forces / FORCE_AU_TO_EV_ANG if frame_forces is not None else None)
 
     print(f"  {len(frames)} frames, {len(symbols)} atoms")
     return symbols, positions, forces
 
 
 def is_scoped_pair(element_a, element_b):
-    cd_se_bond = (
-        element_a in INORGANIC and element_b in INORGANIC and element_a != element_b
-    )
-    metal_oxygen_bond = (element_a in INORGANIC and element_b == "O") or (
+    """
+    Include all inorganic-inorganic pairs (Cd-Cd, Se-Se, Cd-Se)
+    and inorganic-oxygen pairs (Cd-O, Se-O).
+    Organic atoms (C, H) are handled by LAMMPS CHARMM; not fitted here.
+    """
+    both_inorganic = element_a in INORGANIC and element_b in INORGANIC
+    inorganic_O = (element_a in INORGANIC and element_b == "O") or (
         element_b in INORGANIC and element_a == "O"
     )
-    return cd_se_bond or metal_oxygen_bond
+    return both_inorganic or inorganic_O
 
 
-#  Frozen 2-body scales, measured from the RDF
-def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_element):
-    bin_edges = np.linspace(1.8 * ANGSTROM_TO_BOHR, 5.5 * ANGSTROM_TO_BOHR, 75)
+def _compute_A_from_B_scalar(B, sigma, r0, cutoff):
+    """Scalar version (plain floats) for use in data.py geometry routines."""
+    bracket = B * (sigma / r0) ** P - 1.0
+    decay = math.exp(sigma / (r0 - cutoff))
+    return -1.0 / (bracket * decay)
+
+
+def _v2_scalar(r, eps, A, B, sigma, cutoff):
+    if r >= cutoff:
+        return 0.0
+    return eps * A * (B * (sigma / r) ** P - 1.0) * math.exp(sigma / (r - cutoff))
+
+
+def _d2v2_shape_factor(B, sigma, r0, cutoff, dr=1e-5):
+    """d²V2/dr² at r0 with eps=1.0, A derived from B. Units: (energy unit)/Bohr²."""
+    A = _compute_A_from_B_scalar(B, sigma, r0, cutoff)
+    v_p = _v2_scalar(r0 + dr, 1.0, A, B, sigma, cutoff)
+    v_m = _v2_scalar(r0 - dr, 1.0, A, B, sigma, cutoff)
+    v_0 = _v2_scalar(r0,      1.0, A, B, sigma, cutoff)
+    return (v_p - 2.0 * v_0 + v_m) / dr ** 2
+
+
+def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_element, temperature):
+    """
+    Measure r0 (RDF peak), first_minimum, mean coordination, and bond-length variance
+    from a sample of DFT positions.
+
+    Returns (r0_bohr, first_min_bohr, coordination, var_r_bohr_sq)
+    or None if no clear first-shell peak is found.
+    """
+    bond_max_bohr = BOND_MAX_ANG * ANGSTROM_TO_BOHR
+    bin_edges = np.linspace(1.5 * ANGSTROM_TO_BOHR, bond_max_bohr, 100)
     bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    bond_max = BOND_MAX_ANG * ANGSTROM_TO_BOHR
 
     histogram = np.zeros(len(bin_centres))
     coordination = 0.0
     for positions in sampled_positions_bohr:
         distances = cdist(positions[atoms_a], positions[atoms_b])
         if same_element:
-            np.fill_diagonal(distances, np.inf)  # don't count an atom with itself
+            np.fill_diagonal(distances, np.inf)
         histogram += np.histogram(distances, bins=bin_edges)[0]
-        coordination += (distances < bond_max).sum() / len(atoms_a)
+        coordination += (distances < bond_max_bohr).sum() / len(atoms_a)
 
-    g = histogram / np.maximum(
-        bin_centres**2, 1e-12
-    )  # divide out the ~r^2 shell volume
-    g = np.convolve(g, np.ones(3) / 3, mode="same")  # light 3-bin smoothing
+    g = histogram / np.maximum(bin_centres ** 2, 1e-12)
+    g = np.convolve(g, np.ones(3) / 3, mode="same")
 
-    first_shell = bin_centres < bond_max
-    if first_shell.sum() < 2:
+    if g.max() < 1e-10:
         return None
-    bond_length = float(bin_centres[first_shell][np.argmax(g[first_shell])])
 
-    after_peak = (bin_centres > bond_length) & (
-        bin_centres < bond_length + 2.0 * ANGSTROM_TO_BOHR
-    )
+    r0_bohr = float(bin_centres[np.argmax(g)])
+
+    # First minimum: look after the peak up to +2 Å
+    after_peak = (bin_centres > r0_bohr) & (bin_centres < r0_bohr + 2.0 * ANGSTROM_TO_BOHR)
     if after_peak.sum() < 2:
         return None
-    first_minimum = float(bin_centres[after_peak][np.argmin(g[after_peak])])
+    first_min_bohr = float(bin_centres[after_peak][np.argmin(g[after_peak])])
 
-    return bond_length, first_minimum, coordination / len(sampled_positions_bohr)
+    coordination = coordination / len(sampled_positions_bohr)
+
+    # Variance of first-shell bond lengths (up to the first minimum)
+    shell_dists = []
+    for positions in sampled_positions_bohr:
+        distances = cdist(positions[atoms_a], positions[atoms_b])
+        if same_element:
+            np.fill_diagonal(distances, np.inf)
+        in_shell = distances[(distances > 0.5 * ANGSTROM_TO_BOHR) & (distances < first_min_bohr)]
+        shell_dists.extend(in_shell.flatten().tolist())
+
+    var_r_bohr_sq = float(np.var(shell_dists)) if len(shell_dists) > 10 else 1e-3
+
+    return r0_bohr, first_min_bohr, coordination, var_r_bohr_sq
 
 
-def measure_pair_scales(sampled_positions_bohr, symbols, elements):
+def measure_pair_scales(sampled_positions_bohr, symbols, elements, temperature):
+    """
+    For each scoped bond pair: measure r0 from RDF, derive sigma and cutoff,
+    and estimate eps_init from the bond-length variance via equipartition.
+
+    eps_init = kT / Var(r) / (d²V2/dr²|_r0 with eps=1)
+
+    Returns a scales dict with keys: r0, sigma, cutoff, B_init, eps_init.
+    """
     symbols = np.array(symbols)
-    atoms_of_element = {
-        element: np.where(symbols == element)[0] for element in elements
-    }
+    atoms_of_element = {e: np.where(symbols == e)[0] for e in elements}
 
-    scales = {field: {} for field in ("r0", "sigma", "cutoff", "A", "B")}
-    print("\nFrozen 2-body scales (Zhou II-VI shape; only r0 is measured):")
+    scales = {field: {} for field in ("r0", "sigma", "cutoff", "B_init", "eps_init")}
+    kT_ev = BOLTZMANN_EV * temperature
+
+    print("\n2-body scales (r0 measured from RDF; eps_init from bond-length equipartition):")
     for element_a, element_b in combinations_with_replacement(elements, 2):
         if not is_scoped_pair(element_a, element_b):
             continue
-        atoms_a, atoms_b = atoms_of_element[element_a], atoms_of_element[element_b]
+        atoms_a = atoms_of_element.get(element_a, np.array([], dtype=int))
+        atoms_b = atoms_of_element.get(element_b, np.array([], dtype=int))
         if len(atoms_a) == 0 or len(atoms_b) == 0:
             continue
 
         geometry = bond_geometry_from_rdf(
-            sampled_positions_bohr,
-            atoms_a,
-            atoms_b,
+            sampled_positions_bohr, atoms_a, atoms_b,
             same_element=(element_a == element_b),
+            temperature=temperature,
         )
         if geometry is None:
             continue
-        bond_length, first_minimum, coordination = geometry
+        r0_bohr, first_min_bohr, coordination, var_r_bohr_sq = geometry
         bond = canonical_pair(element_a, element_b)
-        if coordination < 0.3 or not (first_minimum > bond_length > 0):
-            print(
-                f"  {bond:>10}: not a bond (coordination={coordination:.2f}) -- skipped"
-            )
+
+        if coordination < 0.05 or not (first_min_bohr > r0_bohr > 0):
+            print(f"  {bond:>8}: no clear bond (coordination={coordination:.2f}) — skipped")
             continue
 
-        sigma = bond_length / SIGMA_RATIO
-        scales["r0"][bond] = bond_length
-        scales["sigma"][bond] = sigma
-        scales["cutoff"][bond] = CUTOFF_RATIO * sigma
-        scales["A"][bond] = ZHOU_A
-        scales["B"][bond] = ZHOU_B
+        sigma_bohr = r0_bohr / SIGMA_RATIO
+        cutoff_bohr = CUTOFF_RATIO * sigma_bohr
+
+        # eps init: equipartition of radial motion.
+        # kT = k_eff * Var(r) => k_eff = kT / Var(r) [eV/Å²]
+        # k_eff = eps * shape_factor  => eps = k_eff / shape_factor
+        # shape_factor = d²V2/dr²|_r0 with eps=1, A from B_init, in Bohr units
+        shape_f = _d2v2_shape_factor(ZHOU_B, sigma_bohr, r0_bohr, cutoff_bohr)
+        kT_hartree = kT_ev / 27.2114  # eV → Hartree
+        k_eff_hartree_per_bohr_sq = kT_hartree / var_r_bohr_sq
+        eps_init_hartree = k_eff_hartree_per_bohr_sq / shape_f
+
+        scales["r0"][bond] = r0_bohr
+        scales["sigma"][bond] = sigma_bohr
+        scales["cutoff"][bond] = cutoff_bohr
+        scales["B_init"][bond] = ZHOU_B
+        scales["eps_init"][bond] = eps_init_hartree
+
+        eps_init_ev = eps_init_hartree * 27.2114
         print(
-            f"  {bond:>10}: r0={bond_length * BOHR_TO_ANGSTROM:.3f}  "
-            f"sigma={sigma * BOHR_TO_ANGSTROM:.3f}  "
-            f"cutoff={scales['cutoff'][bond] * BOHR_TO_ANGSTROM:.3f} Angstrom"
+            f"  {bond:>8}: r0={r0_bohr * BOHR_TO_ANGSTROM:.3f} Å  "
+            f"sigma={sigma_bohr * BOHR_TO_ANGSTROM:.3f} Å  "
+            f"cutoff={cutoff_bohr * BOHR_TO_ANGSTROM:.3f} Å  "
+            f"Var(r)^0.5={var_r_bohr_sq**0.5 * BOHR_TO_ANGSTROM:.3f} Å  "
+            f"eps_init={eps_init_ev:.3f} eV"
         )
     return scales
 
@@ -155,26 +218,22 @@ def enumerate_triplet_types(elements, scoped_bonds):
     return sorted(names)
 
 
-#  Per-frame graph: bonds and triplets
 def build_edges(positions_bohr, symbols, cutoffs_bohr):
-    edges = {}
     if not cutoffs_bohr:
-        return edges
-
+        return {}
     positions_ang = np.asarray(positions_bohr) * BOHR_TO_ANGSTROM
     search_radius = max(cutoffs_bohr.values()) * BOHR_TO_ANGSTROM
     atoms = Atoms(symbols=list(symbols), positions=positions_ang)
-    first, second, distance_ang = neighbor_list(
-        "ijd", atoms, search_radius, self_interaction=False
-    )
+    first, second, distance_ang = neighbor_list("ijd", atoms, search_radius, self_interaction=False)
 
-    symbols = np.array(symbols)
-    once = first < second  # neighbor_list lists each pair twice
-    for atom_i, atom_j, distance_bohr in zip(
+    symbols_arr = np.array(symbols)
+    once = first < second
+    edges = {}
+    for atom_i, atom_j, dist_bohr in zip(
         first[once], second[once], distance_ang[once] / BOHR_TO_ANGSTROM
     ):
-        bond = canonical_pair(symbols[atom_i], symbols[atom_j])
-        if bond in cutoffs_bohr and distance_bohr <= cutoffs_bohr[bond]:
+        bond = canonical_pair(symbols_arr[atom_i], symbols_arr[atom_j])
+        if bond in cutoffs_bohr and dist_bohr <= cutoffs_bohr[bond]:
             i_list, j_list = edges.setdefault(bond, ([], []))
             i_list.append(atom_i)
             j_list.append(atom_j)
@@ -186,25 +245,24 @@ def build_edges(positions_bohr, symbols, cutoffs_bohr):
 
 
 def build_triplets(edges, symbols, triplet_names):
-    # collect each atom's neighbours from the (one-directional) bond lists
     neighbours = {}
-    for atom_i_tensor, atom_j_tensor in edges.values():
-        for atom_i, atom_j in zip(atom_i_tensor.tolist(), atom_j_tensor.tolist()):
+    for atom_i_t, atom_j_t in edges.values():
+        for atom_i, atom_j in zip(atom_i_t.tolist(), atom_j_t.tolist()):
             neighbours.setdefault(atom_i, []).append(atom_j)
             neighbours.setdefault(atom_j, []).append(atom_i)
 
-    symbols = np.array(symbols)
-    triplet_names = set(triplet_names)
+    symbols_arr = np.array(symbols)
+    triplet_names_set = set(triplet_names)
     triplets = {}
     for centre, centre_neighbours in neighbours.items():
         for atom_a, atom_b in combinations(centre_neighbours, 2):
-            name = canonical_triplet(symbols[centre], symbols[atom_a], symbols[atom_b])
-            if name not in triplet_names:
+            name = canonical_triplet(symbols_arr[centre], symbols_arr[atom_a], symbols_arr[atom_b])
+            if name not in triplet_names_set:
                 continue
-            if symbols[atom_b] < symbols[atom_a]:  # order legs to match the name
+            if symbols_arr[atom_b] < symbols_arr[atom_a]:
                 atom_a, atom_b = atom_b, atom_a
-            centre_list, a_list, b_list = triplets.setdefault(name, ([], [], []))
-            centre_list.append(centre)
+            c_list, a_list, b_list = triplets.setdefault(name, ([], [], []))
+            c_list.append(centre)
             a_list.append(atom_a)
             b_list.append(atom_b)
 
@@ -219,12 +277,11 @@ def build_triplets(edges, symbols, triplet_names):
 
 
 def make_batch(frames, atoms_per_frame):
-    positions = torch.cat([frame["positions"] for frame in frames])
-    dft_forces = torch.cat([frame["dft_forces"] for frame in frames])
-    fit_mask = torch.cat([frame["fit_mask"] for frame in frames])
+    positions = torch.cat([f["positions"] for f in frames])
+    dft_forces = torch.cat([f["dft_forces"] for f in frames])
+    fit_mask = torch.cat([f["fit_mask"] for f in frames])
 
-    edges = {}
-    triplets = {}
+    edges, triplets = {}, {}
     offset = 0
     for frame in frames:
         for bond, (atom_i, atom_j) in frame["edges"].items():
@@ -252,13 +309,12 @@ def make_batch(frames, atoms_per_frame):
     }
 
 
-#  Dataset: load everything and build one graph per frame
 class DFTDataset:
     def __init__(self, dataset_configs, first_n_frames=None):
         print(f"\n{'=' * 60}\nLOADING DATA\n{'=' * 60}")
         self.symbols = None
-        self.positions = []  # list of (n_atoms, 3) Bohr arrays
-        self.forces = []  # list of (n_atoms, 3) au arrays (or None)
+        self.positions = []
+        self.forces = []
         for dataset in dataset_configs:
             print(f"\n{dataset.get('name', dataset['xyz'])}")
             symbols, positions, forces = read_trajectory(
@@ -273,22 +329,18 @@ class DFTDataset:
 
         self.atoms_per_frame = len(self.symbols)
         self.elements = sorted(set(self.symbols))
-        self.fit_mask = np.array([element in INORGANIC for element in self.symbols])
+        self.fit_mask = np.array([e in INORGANIC for e in self.symbols])
 
         counts = Counter(self.symbols)
-        print(
-            "\nElements (" + ", ".join(f"{e}={counts[e]}" for e in self.elements) + ")"
-        )
+        print("\nElements (" + ", ".join(f"{e}={counts[e]}" for e in self.elements) + ")")
         print(f"{len(self.positions)} frames, {self.atoms_per_frame} atoms each")
 
-    def build_graphs(self):
+    def build_graphs(self, temperature=650):
         sample = self.positions[:: max(1, len(self.positions) // 50)]
         sampled = [np.asarray(p) for p in sample]
-        self.scales = measure_pair_scales(sampled, self.symbols, self.elements)
+        self.scales = measure_pair_scales(sampled, self.symbols, self.elements, temperature)
         self.cutoffs_bohr = self.scales["cutoff"]
-        self.triplet_type_names = enumerate_triplet_types(
-            self.elements, self.cutoffs_bohr
-        )
+        self.triplet_type_names = enumerate_triplet_types(self.elements, self.cutoffs_bohr)
         print(
             f"Scoped bonds: {len(self.cutoffs_bohr)}, "
             f"triplet types: {len(self.triplet_type_names)}"
@@ -308,13 +360,11 @@ class DFTDataset:
                 if forces_au is not None
                 else torch.zeros_like(positions)
             )
-            self.graphs.append(
-                {
-                    "positions": positions,
-                    "dft_forces": dft_forces,
-                    "fit_mask": fit_mask,
-                    "edges": edges,
-                    "triplets": triplets,
-                }
-            )
+            self.graphs.append({
+                "positions": positions,
+                "dft_forces": dft_forces,
+                "fit_mask": fit_mask,
+                "edges": edges,
+                "triplets": triplets,
+            })
         print(f"done ({len(self.graphs)} graphs)")
