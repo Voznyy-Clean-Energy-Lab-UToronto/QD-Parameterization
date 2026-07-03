@@ -19,26 +19,14 @@ from .utils import (
     canonical_triplet,
 )
 
-# SW shape parameters — fixed from Zhou et al. (PRB 88, 085309, 2013).
-# Only sigma (derived from r0) and cutoff (from CUTOFF_RATIO) are measured per bond.
 ZHOU_B = 1.116149    # initial B — will be optimized per bond
-SIGMA_RATIO = 1.28094    # r0 / sigma  (location of V2 minimum)
-CUTOFF_RATIO = 1.953387  # cutoff / sigma  (SW 'a' parameter)
+SIGMA_RATIO = 1.28094    # r0 / sigma  (location of V2 minimum) FIX LATER
+CUTOFF_RATIO = 1.953387  # cutoff / sigma  (SW 'a' parameter) FIX LATER
 P = 4.0  # (sigma/r)^p exponent
 
 BOLTZMANN_EV = 8.617333e-5  # eV/K
-
-# First-shell search window. 5.5 Å captures both Cd-Se (~2.7 Å) and
-# same-species second-neighbours Cd-Cd / Se-Se (~4.3-4.5 Å).
 BOND_MAX_ANG = 5.5
-
-# Elements whose forces are fit by SW. Cd and Se only: their DFT forces are pure
-# framework (CHARMM/Infante do not act on them), so the fit target is clean.
-INORGANIC = {"Cd", "Se"}
-
-# Elements counted as "framework" when naming the output .sw file (listed before
-# ligand atoms in the formula string). Broader than INORGANIC — used only for
-# filenames, never for the fit scope.
+INORGANIC = {"Cd", "Se"} #Make sure not Cd Se only
 _QD_ELEMENTS = {"Cd", "Se", "Zn", "S", "Pb", "Te"}
 
 
@@ -71,7 +59,6 @@ def read_trajectory(filepath, fmt="extxyz", first_n=None, skip_n=None):
 
 
 def is_scoped_pair(element_a, element_b):
-    """Cd/Se pairs and Cd-O/Se-O. Organic atoms (C, H) are handled by CHARMM, not fit here."""
     both_inorganic = element_a in INORGANIC and element_b in INORGANIC
     inorganic_O = (element_a in INORGANIC and element_b == "O") or (
         element_b in INORGANIC and element_a == "O"
@@ -80,7 +67,6 @@ def is_scoped_pair(element_a, element_b):
 
 
 def _compute_A_from_B_scalar(B, sigma, r0, cutoff):
-    """Scalar version (plain floats) for use in data.py geometry routines."""
     bracket = B * (sigma / r0) ** P - 1.0
     decay = math.exp(sigma / (r0 - cutoff))
     return -1.0 / (bracket * decay)
@@ -93,7 +79,6 @@ def _v2_scalar(r, eps, A, B, sigma, cutoff):
 
 
 def _d2v2_shape_factor(B, sigma, r0, cutoff, dr=1e-5):
-    """d²V2/dr² at r0 with eps=1.0, A derived from B. Units: (energy unit)/Bohr²."""
     A = _compute_A_from_B_scalar(B, sigma, r0, cutoff)
     v_p = _v2_scalar(r0 + dr, 1.0, A, B, sigma, cutoff)
     v_m = _v2_scalar(r0 - dr, 1.0, A, B, sigma, cutoff)
@@ -102,8 +87,6 @@ def _d2v2_shape_factor(B, sigma, r0, cutoff, dr=1e-5):
 
 
 def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_element):
-    """Returns (r0_bohr, first_min_bohr, coordination, var_r_bohr_sq) from a position sample,
-    or None if there is no clear first-shell RDF peak."""
     bond_max_bohr = BOND_MAX_ANG * ANGSTROM_TO_BOHR
     bin_edges = np.linspace(1.5 * ANGSTROM_TO_BOHR, bond_max_bohr, 100)
     bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -148,8 +131,6 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
 
 
 def measure_pair_scales(sampled_positions_bohr, symbols, elements, temperature):
-    """Per scoped bond: r0 from the RDF peak, sigma/cutoff from the SW ratios, and
-    eps_init from bond-length equipartition. Returns dict of r0, sigma, cutoff, B_init, eps_init."""
     symbols = np.array(symbols)
     atoms_of_element = {e: np.where(symbols == e)[0] for e in elements}
 
@@ -333,6 +314,7 @@ class DFTDataset:
         # chemical_formula names the output .sw file. A single dataset gets its
         # exact formula (e.g. Cd68Se55...); a multi-QD run gets the shared framework
         # elements plus a "_universal" tag (e.g. CdSe_universal).
+        # REMOVE UNIVERSAL - SMARTER NAMING?
         if len(self._datasets) == 1:
             self.chemical_formula = _chemical_formula(self._datasets[0]["symbols"])
         else:
@@ -343,9 +325,7 @@ class DFTDataset:
         print(f"\nElements: {self.elements}")
         print(f"{len(self._datasets)} dataset(s), {total_frames} frames total")
 
-    def build_graphs(self, temperature=650):
-        # Scales come from the first dataset, which must contain every element type;
-        # all QDs share the same bond types, so one set of scales applies globally.
+    def build_graphs(self, temperature=650): #this is stupid
         ref = self._datasets[0]
         ref_sample = ref["positions"][:: max(1, len(ref["positions"]) // 50)]
         self.scales = measure_pair_scales(
