@@ -1,34 +1,3 @@
-"""
-SW force model — v31.
-
-Compared with v29, this version removes the equilibrium-condition constraint that
-derived A and B analytically from r_min.  Instead A, B, p, q, gamma are all direct
-trainable parameters (per bond type).  sigma and cutoff (a) remain fixed from the
-dataset RDF.
-
-Trained per bond:
-    eps           (> 0, direct tensor clamped to min 1e-4)
-    raw_A         → A = exp(raw_A)               (A > 0)
-    raw_B         → B = softplus(raw_B)          (B > 0)
-    raw_p         → p = raw_p                   (unconstrained)
-    raw_q         → q = raw_q                   (unconstrained)
-    raw_gamma     → gamma = softplus(raw_gamma)  (gamma > 0)
-    raw_lam       → lam = exp(raw_lam)          (lam > 0)
-    raw_theta0    → cos(theta0) = tanh(raw_theta0)  (in [-1,1])
-
-Frozen:
-    sigma         (from RDF peak / SIGMA_RATIO in data.py)
-    cutoff        (= CUTOFF_RATIO * sigma in data.py)
-
-2-body form (full SW bracket):
-    V2(r) = A * eps * (B*(sigma/r)^p - (sigma/r)^q) * exp(sigma/(r - cutoff))
-
-    q=0 recovers the original SW bracket (B*(sigma/r)^p - 1 at r=sigma).
-    p and q are unconstrained so the optimizer can find non-bonding shapes freely.
-
-3-body form (unchanged from v29 except gamma is now per-bond):
-    V3 ~ lam_ca * lam_cb * exp(...) * (cos_theta - cos_theta0)^2
-"""
 import torch
 import torch.nn.functional as F
 
@@ -36,11 +5,6 @@ from .utils import canonical_pair
 
 
 def sw_2body_force(bond_length, eps, A, B, p, q, sigma, cutoff):
-    """
-    Force magnitude -dV2/dr (positive = repulsion).
-
-    V2 = A*eps*(B*(sigma/r)^p - (sigma/r)^q)*exp(sigma/(r-cutoff))
-    """
     sig_over_r = sigma / bond_length
     bracket    = B * sig_over_r**p - sig_over_r**q
     d_bracket  = (p * B * sig_over_r**p - q * sig_over_r**q) / bond_length
