@@ -36,26 +36,16 @@ def softplus_inv(y):
     """Inverse of softplus: x such that softplus(x) = y > 0."""
     return math.log(math.expm1(max(y, 1e-6)))
 
-
-# ---------------------------------------------------------------------------
-# Analytical helpers — used only to seed A and B; not a constraint during training.
-# ---------------------------------------------------------------------------
+#CAN I REMOVE THESE? program is too slow
 
 def _b_init(r0, sigma, cutoff):
-    """B at the equilibrium condition dV2/dr=0 with p=4, q=0."""
     gap_sq = (r0 - cutoff) ** 2
     return (r0 / sigma) ** 4 / (1.0 + 4.0 * gap_sq / (sigma * r0))
 
 
 def _a_init(r0, sigma, cutoff, b):
-    """A so that V2(r0) = -eps with p=4, q=0."""
     bracket = b * (sigma / r0) ** 4 - 1.0
     return -1.0 / (bracket * math.exp(sigma / (r0 - cutoff)))
-
-
-# ---------------------------------------------------------------------------
-# cos(theta0) and lambda seeds from dataset statistics
-# ---------------------------------------------------------------------------
 
 def gather_cos_samples(graphs, stride):
     samples = {}
@@ -83,7 +73,6 @@ def initial_cos_theta0(triplet_names, cos_samples):
 
 
 def initial_lam(scales, cos_samples, temperature):
-    """Per-bond lambda seed from angular equipartition using gamma=GAMMA_INIT."""
     lam_init = {}
     for bond in scales["cutoff"]:
         elem_a, elem_b = bond.split("-")
@@ -106,10 +95,7 @@ def initial_lam(scales, cos_samples, temperature):
 
     return lam_init
 
-
-# ---------------------------------------------------------------------------
 # Parameter initialisation
-# ---------------------------------------------------------------------------
 
 def initialise_parameters(dataset, temperature, log):
     stride          = max(1, len(dataset.graphs) // 200)
@@ -208,16 +194,9 @@ def initialise_parameters(dataset, temperature, log):
         "cutoff": dataset.scales["cutoff"],
     }
 
-
-# ---------------------------------------------------------------------------
 # Training loop
-# ---------------------------------------------------------------------------
 
 def epoch_rmse(batches_per_qd, params, train, optimizer=None):
-    """
-    Compute RMSE as the mean of per-QD RMSEs so every dataset contributes equally
-    regardless of how many atoms each QD contains.
-    """
     qd_order = list(range(len(batches_per_qd)))
     if train:
         random.shuffle(qd_order)
