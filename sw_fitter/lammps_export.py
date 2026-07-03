@@ -1,76 +1,146 @@
 """
-Write fitted SW parameters to a LAMMPS .sw file.
+SW force model — v31.
 
-v31 change from v29: A, B, p, q, gamma are now per-bond direct fit parameters
-(not derived from r_min). They are read directly from params.
+Compared with v29, this version removes the equilibrium-condition constraint that
+derived A and B analytically from r_min.  Instead A, B, p, q, gamma are all direct
+trainable parameters (per bond type).  sigma and cutoff (a) remain fixed from the
+dataset RDF.
+
+Trained per bond:
+    eps           (> 0, direct tensor clamped to min 1e-4)
+    raw_A         → A = exp(raw_A)               (A > 0)
+    raw_B         → B = softplus(raw_B)          (B > 0)
+    raw_p         → p = raw_p                   (unconstrained)
+    raw_q         → q = raw_q                   (unconstrained)
+    raw_gamma     → gamma = softplus(raw_gamma)  (gamma > 0)
+    raw_lam       → lam = exp(raw_lam)          (lam > 0)
+    raw_theta0    → cos(theta0) = tanh(raw_theta0)  (in [-1,1])
+
+Frozen:
+    sigma         (from RDF peak / SIGMA_RATIO in data.py)
+    cutoff        (= CUTOFF_RATIO * sigma in data.py)
+
+2-body form (full SW bracket):
+    V2(r) = A * eps * (B*(sigma/r)^p - (sigma/r)^q) * exp(sigma/(r - cutoff))
+
+    q=0 recovers the original SW bracket (B*(sigma/r)^p - 1 at r=sigma).
+    p and q are unconstrained so the optimizer can find non-bonding shapes freely.
+
+3-body form (unchanged from v29 except gamma is now per-bond):
+    V3 ~ lam_ca * lam_cb * exp(...) * (cos_theta - cos_theta0)^2
 """
-import math
-import os
-
+import torch
 import torch.nn.functional as F
 
-from .utils import BOHR_TO_ANGSTROM, HARTREE_TO_EV, canonical_pair, canonical_triplet
+from .utils import canonical_pair
 
 
-def export_lammps(results_dir, dataset, params, formula):
-    eps         = params["eps"]
-    sw_elements = sorted({element for bond in eps for element in bond.split("-")})
-    triplet_types = set(dataset.triplet_type_names)
+def sw_2body_force(bond_length, eps, A, B, p, q, sigma, cutoff):
+    """
+    Force magnitude -dV2/dr (positive = repulsion).
 
-    sw_filename = f"{formula}.sw"
-    filepath    = os.path.join(results_dir, sw_filename)
-    with open(filepath, "w") as f:
-        f.write("# Stillinger-Weber v31: A, B, p, q, gamma, eps, lambda, theta0 all trained\n")
-        f.write(f"# SW elements: {sw_elements}\n")
-        f.write(f"# LAMMPS pair_coeff * * {sw_filename} " + " ".join(sw_elements) + "\n")
-        f.write("# i j k  eps sigma a lambda gamma cos0 A B p q tol\n")
-        for ei in sw_elements:
-            for ej in sw_elements:
-                for ek in sw_elements:
-                    f.write(_sw_line(ei, ej, ek, params, triplet_types) + "\n")
-
-    print(f"  wrote {filepath} ({len(sw_elements)**3} lines)")
-    print(f"  LAMMPS: pair_coeff * * {sw_filename} {' '.join(sw_elements)}")
-    return sw_elements
+    V2 = A*eps*(B*(sigma/r)^p - (sigma/r)^q)*exp(sigma/(r-cutoff))
+    """
+    sig_over_r = sigma / bond_length
+    bracket    = B * sig_over_r**p - sig_over_r**q
+    d_bracket  = (p * B * sig_over_r**p - q * sig_over_r**q) / bond_length
+    inv_gap    = 1.0 / (bond_length - cutoff)   # negative because r < cutoff always
+    decay      = torch.exp(sigma * inv_gap)
+    return A * eps * decay * (d_bracket + bracket * sigma * inv_gap**2)
 
 
-def _sw_line(ei, ej, ek, params, triplet_types):
-    bond_ik = canonical_pair(ei, ek)
-    bond_ij = canonical_pair(ei, ej)
+def sw_3body_forces(
+    vec_ca, vec_cb,
+    strength, cos_theta0,
+    gamma_sigma_ca, gamma_sigma_cb,
+    cutoff_ca, cutoff_cb,
+):
+    length_ca = vec_ca.norm(dim=1)
+    length_cb = vec_cb.norm(dim=1)
+    cos_theta  = (vec_ca * vec_cb).sum(dim=1) / (length_ca * length_cb)
 
-    if bond_ik in params["eps"]:
-        eps_ev    = params["eps"][bond_ik].item() * HARTREE_TO_EV
-        sigma_ang = params["sigma"][bond_ik] * BOHR_TO_ANGSTROM
-        cutoff_b  = params["cutoff"][bond_ik]
-        sigma_b   = params["sigma"][bond_ik]
-        a_val     = cutoff_b / sigma_b            # LAMMPS 'a' = cutoff / sigma
-        A_val     = math.exp(params["raw_A"][bond_ik].item())
-        B_val     = F.softplus(params["raw_B"][bond_ik]).item()
-        p_val     = params["raw_p"][bond_ik].item()
-        q_val     = params["raw_q"][bond_ik].item()
-        gamma_val = F.softplus(params["raw_gamma"][bond_ik]).item()
-    else:
-        eps_ev, A_val, B_val = 0.0, 0.0, 1.0
-        sigma_ang, a_val    = 2.0, 1.5
-        p_val, q_val, gamma_val = 4.0, 0.0, 1.2
+    gap_ca = (length_ca - cutoff_ca).clamp(max=-1e-9)
+    gap_cb = (length_cb - cutoff_cb).clamp(max=-1e-9)
+    decay_ca     = torch.exp(gamma_sigma_ca / gap_ca)
+    decay_cb     = torch.exp(gamma_sigma_cb / gap_cb)
+    energy_scale = strength * decay_ca * decay_cb
 
-    triplet_name  = canonical_triplet(ei, ej, ek)
-    parameterized = (triplet_name in triplet_types
-                     and bond_ik in params["eps"]
-                     and bond_ij in params["eps"]
-                     and eps_ev > 1e-12)
-    if parameterized:
-        lam_ij     = math.exp(params["raw_lam"][bond_ij].item())
-        lam_ik     = math.exp(params["raw_lam"][bond_ik].item())
-        eps_ik     = params["eps"][bond_ik].item()
-        lam_lammps = math.sqrt(lam_ij * lam_ik) / max(abs(eps_ik), 1e-12)
-        cos0       = math.tanh(params["raw_theta0"][triplet_name].item())
-    else:
-        lam_lammps, cos0 = 0.0, -1.0 / 3.0
+    angle_term = cos_theta - cos_theta0
+    radial     = energy_scale * angle_term ** 2
+    angular    = 2.0 * energy_scale * angle_term
 
-    return (
-        f"{ei} {ej} {ek} "
-        f"{eps_ev:.10f} {sigma_ang:.10f} {a_val:.10f} "
-        f"{lam_lammps:.10f} {gamma_val:.10f} {cos0:.10f} "
-        f"{A_val:.10f} {B_val:.10f} {p_val:.10f} {q_val:.10f} 0.0"
-    )
+    decay_slope_ca    = gamma_sigma_ca / gap_ca ** 2 / length_ca
+    decay_slope_cb    = gamma_sigma_cb / gap_cb ** 2 / length_cb
+    cos_over_lensq_ca = cos_theta / length_ca ** 2
+    cos_over_lensq_cb = cos_theta / length_cb ** 2
+    cross = 1.0 / (length_ca * length_cb)
+
+    along_ca = radial * decay_slope_ca + angular * cos_over_lensq_ca
+    along_cb = radial * decay_slope_cb + angular * cos_over_lensq_cb
+    mixed    = -angular * cross
+
+    force_a = along_ca.unsqueeze(1) * vec_ca + mixed.unsqueeze(1) * vec_cb
+    force_b = mixed.unsqueeze(1) * vec_ca + along_cb.unsqueeze(1) * vec_cb
+    return force_a, force_b
+
+
+def two_body_forces(positions, edges_by_type, params):
+    forces = torch.zeros_like(positions)
+    for bond in edges_by_type:
+        atom_i, atom_j = edges_by_type[bond]
+        bond_vector = positions[atom_j] - positions[atom_i]
+        bond_length = bond_vector.norm(dim=1)
+
+        A = torch.exp(params["raw_A"][bond])
+        B = F.softplus(params["raw_B"][bond])
+        p = params["raw_p"][bond]     # unconstrained
+        q = params["raw_q"][bond]     # unconstrained
+
+        force_magnitude = sw_2body_force(
+            bond_length,
+            params["eps"][bond],
+            A, B, p, q,
+            params["sigma"][bond],
+            params["cutoff"][bond],
+        )
+        bond_force = (force_magnitude / bond_length).unsqueeze(1) * bond_vector
+        forces = forces.index_add(0, atom_i, -bond_force)
+        forces = forces.index_add(0, atom_j,  bond_force)
+    return forces
+
+
+def three_body_forces(positions, triplets_by_type, params):
+    forces = torch.zeros_like(positions)
+    for triplet_name in triplets_by_type:
+        centre_idx, a_idx, b_idx = triplets_by_type[triplet_name]
+        centre, legs = triplet_name.split(":")
+        leg_a, leg_b = legs.split("-")
+        bond_ca = canonical_pair(centre, leg_a)
+        bond_cb = canonical_pair(centre, leg_b)
+
+        lam_ca     = torch.exp(params["raw_lam"][bond_ca])
+        lam_cb     = torch.exp(params["raw_lam"][bond_cb])
+        strength   = torch.sqrt(lam_ca * lam_cb)
+        cos_theta0 = torch.tanh(params["raw_theta0"][triplet_name])
+        gamma_ca   = F.softplus(params["raw_gamma"][bond_ca])
+        gamma_cb   = F.softplus(params["raw_gamma"][bond_cb])
+
+        force_a, force_b = sw_3body_forces(
+            positions[a_idx]      - positions[centre_idx],
+            positions[b_idx]      - positions[centre_idx],
+            strength, cos_theta0,
+            gamma_ca * params["sigma"][bond_ca],
+            gamma_cb * params["sigma"][bond_cb],
+            params["cutoff"][bond_ca],
+            params["cutoff"][bond_cb],
+        )
+        forces = forces.index_add(0, a_idx,       force_a)
+        forces = forces.index_add(0, b_idx,       force_b)
+        forces = forces.index_add(0, centre_idx, -(force_a + force_b))
+    return forces
+
+
+def sw_forces(graph, params):
+    two   = two_body_forces(  graph["positions"], graph["edges"],    params)
+    three = three_body_forces(graph["positions"], graph["triplets"], params)
+    return two + three
