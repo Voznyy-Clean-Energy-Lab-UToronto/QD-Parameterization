@@ -34,11 +34,6 @@ PLOT_COLORS = ["#1f77b4", "#ff7f0e", "#9467bd", "#8c564b",
 
 
 def plot_sw_potentials(params, scales, filepath):
-    """
-    Two-panel figure:
-      Left:  V2(r) in eV — one curve per bond type.
-      Right: V3(theta) at r=r0 — one curve per triplet type.
-    """
     eps        = params["eps"]
     raw_lam    = params["raw_lam"]
     raw_theta0 = params["raw_theta0"]
