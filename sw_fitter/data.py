@@ -12,21 +12,41 @@ from scipy.spatial.distance import cdist
 from .utils import (
     ANGSTROM_TO_BOHR,
     BOHR_TO_ANGSTROM,
+    EV_TO_HARTREE,
     FORCE_AU_TO_EV_ANG,
+    HARTREE_TO_EV,
     canonical_pair,
     canonical_triplet,
 )
 
-ZHOU_B = 1.116149    # initial B 
+# SW shape parameters — fixed from Zhou et al. (PRB 88, 085309, 2013).
+# Only sigma (derived from r0) and cutoff (from CUTOFF_RATIO) are measured per bond.
+ZHOU_B = 1.116149    # initial B — will be optimized per bond
 SIGMA_RATIO = 1.28094    # r0 / sigma  (location of V2 minimum)
 CUTOFF_RATIO = 1.953387  # cutoff / sigma  (SW 'a' parameter)
 P = 4.0  # (sigma/r)^p exponent
 
 BOLTZMANN_EV = 8.617333e-5  # eV/K
 
+# First-shell search window. 5.5 Å captures both Cd-Se (~2.7 Å) and
+# same-species second-neighbours Cd-Cd / Se-Se (~4.3-4.5 Å).
 BOND_MAX_ANG = 5.5
 
+# Elements whose forces are fit by SW. Cd and Se only: their DFT forces are pure
+# framework (CHARMM/Infante do not act on them), so the fit target is clean.
 INORGANIC = {"Cd", "Se"}
+
+# Elements counted as "framework" when naming the output .sw file (listed before
+# ligand atoms in the formula string). Broader than INORGANIC — used only for
+# filenames, never for the fit scope.
+_QD_ELEMENTS = {"Cd", "Se", "Zn", "S", "Pb", "Te"}
+
+
+def _chemical_formula(symbols):
+    counts = Counter(symbols)
+    qd = sorted(e for e in counts if e in _QD_ELEMENTS)
+    other = sorted(e for e in counts if e not in _QD_ELEMENTS)
+    return "".join(f"{e}{counts[e]}" for e in qd + other)
 
 
 def read_trajectory(filepath, fmt="extxyz", first_n=None, skip_n=None):
@@ -51,6 +71,7 @@ def read_trajectory(filepath, fmt="extxyz", first_n=None, skip_n=None):
 
 
 def is_scoped_pair(element_a, element_b):
+    """Cd/Se pairs and Cd-O/Se-O. Organic atoms (C, H) are handled by CHARMM, not fit here."""
     both_inorganic = element_a in INORGANIC and element_b in INORGANIC
     inorganic_O = (element_a in INORGANIC and element_b == "O") or (
         element_b in INORGANIC and element_a == "O"
@@ -59,6 +80,7 @@ def is_scoped_pair(element_a, element_b):
 
 
 def _compute_A_from_B_scalar(B, sigma, r0, cutoff):
+    """Scalar version (plain floats) for use in data.py geometry routines."""
     bracket = B * (sigma / r0) ** P - 1.0
     decay = math.exp(sigma / (r0 - cutoff))
     return -1.0 / (bracket * decay)
@@ -71,6 +93,7 @@ def _v2_scalar(r, eps, A, B, sigma, cutoff):
 
 
 def _d2v2_shape_factor(B, sigma, r0, cutoff, dr=1e-5):
+    """d²V2/dr² at r0 with eps=1.0, A derived from B. Units: (energy unit)/Bohr²."""
     A = _compute_A_from_B_scalar(B, sigma, r0, cutoff)
     v_p = _v2_scalar(r0 + dr, 1.0, A, B, sigma, cutoff)
     v_m = _v2_scalar(r0 - dr, 1.0, A, B, sigma, cutoff)
@@ -78,7 +101,9 @@ def _d2v2_shape_factor(B, sigma, r0, cutoff, dr=1e-5):
     return (v_p - 2.0 * v_0 + v_m) / dr ** 2
 
 
-def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_element, temperature):
+def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_element):
+    """Returns (r0_bohr, first_min_bohr, coordination, var_r_bohr_sq) from a position sample,
+    or None if there is no clear first-shell RDF peak."""
     bond_max_bohr = BOND_MAX_ANG * ANGSTROM_TO_BOHR
     bin_edges = np.linspace(1.5 * ANGSTROM_TO_BOHR, bond_max_bohr, 100)
     bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -100,6 +125,7 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
 
     r0_bohr = float(bin_centres[np.argmax(g)])
 
+    # First minimum: look after the peak up to +2 Å
     after_peak = (bin_centres > r0_bohr) & (bin_centres < r0_bohr + 2.0 * ANGSTROM_TO_BOHR)
     if after_peak.sum() < 2:
         return None
@@ -107,6 +133,7 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
 
     coordination = coordination / len(sampled_positions_bohr)
 
+    # Variance of first-shell bond lengths (up to the first minimum)
     shell_dists = []
     for positions in sampled_positions_bohr:
         distances = cdist(positions[atoms_a], positions[atoms_b])
@@ -121,6 +148,8 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
 
 
 def measure_pair_scales(sampled_positions_bohr, symbols, elements, temperature):
+    """Per scoped bond: r0 from the RDF peak, sigma/cutoff from the SW ratios, and
+    eps_init from bond-length equipartition. Returns dict of r0, sigma, cutoff, B_init, eps_init."""
     symbols = np.array(symbols)
     atoms_of_element = {e: np.where(symbols == e)[0] for e in elements}
 
@@ -139,7 +168,6 @@ def measure_pair_scales(sampled_positions_bohr, symbols, elements, temperature):
         geometry = bond_geometry_from_rdf(
             sampled_positions_bohr, atoms_a, atoms_b,
             same_element=(element_a == element_b),
-            temperature=temperature,
         )
         if geometry is None:
             continue
@@ -153,12 +181,9 @@ def measure_pair_scales(sampled_positions_bohr, symbols, elements, temperature):
         sigma_bohr = r0_bohr / SIGMA_RATIO
         cutoff_bohr = CUTOFF_RATIO * sigma_bohr
 
-        # eps init: equipartition of radial motion.
-        # kT = k_eff * Var(r) => k_eff = kT / Var(r) [eV/Å²]
-        # k_eff = eps * shape_factor  => eps = k_eff / shape_factor
-        # shape_factor = d²V2/dr²|_r0 with eps=1, A from B_init, in Bohr units
+        # eps_init: match equipartition stiffness kT/Var(r) to the SW well curvature (see guide).
         shape_f = _d2v2_shape_factor(ZHOU_B, sigma_bohr, r0_bohr, cutoff_bohr)
-        kT_hartree = kT_ev / 27.2114  # eV → Hartree
+        kT_hartree = kT_ev * EV_TO_HARTREE
         k_eff_hartree_per_bohr_sq = kT_hartree / var_r_bohr_sq
         eps_init_hartree = k_eff_hartree_per_bohr_sq / shape_f
 
@@ -168,7 +193,7 @@ def measure_pair_scales(sampled_positions_bohr, symbols, elements, temperature):
         scales["B_init"][bond] = ZHOU_B
         scales["eps_init"][bond] = eps_init_hartree
 
-        eps_init_ev = eps_init_hartree * 27.2114
+        eps_init_ev = eps_init_hartree * HARTREE_TO_EV
         print(
             f"  {bond:>8}: r0={r0_bohr * BOHR_TO_ANGSTROM:.3f} Å  "
             f"sigma={sigma_bohr * BOHR_TO_ANGSTROM:.3f} Å  "
@@ -248,7 +273,7 @@ def build_triplets(edges, symbols, triplet_names):
     }
 
 
-def make_batch(frames, atoms_per_frame):
+def make_batch(frames):
     positions = torch.cat([f["positions"] for f in frames])
     dft_forces = torch.cat([f["dft_forces"] for f in frames])
     fit_mask = torch.cat([f["fit_mask"] for f in frames])
@@ -256,6 +281,7 @@ def make_batch(frames, atoms_per_frame):
     edges, triplets = {}, {}
     offset = 0
     for frame in frames:
+        n_atoms = frame["positions"].shape[0]
         for bond, (atom_i, atom_j) in frame["edges"].items():
             i_list, j_list = edges.setdefault(bond, ([], []))
             i_list.append(atom_i + offset)
@@ -265,7 +291,7 @@ def make_batch(frames, atoms_per_frame):
             c_list.append(centre + offset)
             a_list.append(atom_a + offset)
             b_list.append(atom_b + offset)
-        offset += atoms_per_frame
+        offset += n_atoms
 
     edges = {bond: (torch.cat(i), torch.cat(j)) for bond, (i, j) in edges.items()}
     triplets = {
@@ -284,33 +310,50 @@ def make_batch(frames, atoms_per_frame):
 class DFTDataset:
     def __init__(self, dataset_configs, first_n_frames=None):
         print(f"\n{'=' * 60}\nLOADING DATA\n{'=' * 60}")
-        self.symbols = None
-        self.positions = []
-        self.forces = []
-        for dataset in dataset_configs:
-            print(f"\n{dataset.get('name', dataset['xyz'])}")
+
+        # Kept separate because different QDs can have different atom counts.
+        self._datasets = []
+        for cfg in dataset_configs:
+            print(f"\n{cfg.get('name', cfg['xyz'])}")
             symbols, positions, forces = read_trajectory(
-                dataset["xyz"],
-                fmt=dataset.get("format", "extxyz"),
-                first_n=dataset.get("first_n_frames", first_n_frames),
-                skip_n=dataset.get("skip_frames"),
+                cfg["xyz"],
+                fmt=cfg.get("format", "extxyz"),
+                first_n=cfg.get("first_n_frames", first_n_frames),
+                skip_n=cfg.get("skip_frames"),
             )
-            self.symbols = symbols
-            self.positions += positions
-            self.forces += forces
+            self._datasets.append({
+                "name":      cfg.get("name", ""),
+                "symbols":   symbols,
+                "positions": positions,
+                "forces":    forces,
+            })
 
-        self.atoms_per_frame = len(self.symbols)
-        self.elements = sorted(set(self.symbols))
-        self.fit_mask = np.array([e in INORGANIC for e in self.symbols])
+        self.elements = sorted({e for ds in self._datasets for e in ds["symbols"]})
 
-        counts = Counter(self.symbols)
-        print("\nElements (" + ", ".join(f"{e}={counts[e]}" for e in self.elements) + ")")
-        print(f"{len(self.positions)} frames, {self.atoms_per_frame} atoms each")
+        # chemical_formula names the output .sw file. A single dataset gets its
+        # exact formula (e.g. Cd68Se55...); a multi-QD run gets the shared framework
+        # elements plus a "_universal" tag (e.g. CdSe_universal).
+        if len(self._datasets) == 1:
+            self.chemical_formula = _chemical_formula(self._datasets[0]["symbols"])
+        else:
+            framework_elems = sorted(e for e in self.elements if e in _QD_ELEMENTS)
+            self.chemical_formula = "".join(framework_elems) + "_universal"
+
+        total_frames = sum(len(ds["positions"]) for ds in self._datasets)
+        print(f"\nElements: {self.elements}")
+        print(f"{len(self._datasets)} dataset(s), {total_frames} frames total")
 
     def build_graphs(self, temperature=650):
-        sample = self.positions[:: max(1, len(self.positions) // 50)]
-        sampled = [np.asarray(p) for p in sample]
-        self.scales = measure_pair_scales(sampled, self.symbols, self.elements, temperature)
+        # Scales come from the first dataset, which must contain every element type;
+        # all QDs share the same bond types, so one set of scales applies globally.
+        ref = self._datasets[0]
+        ref_sample = ref["positions"][:: max(1, len(ref["positions"]) // 50)]
+        self.scales = measure_pair_scales(
+            [np.asarray(p) for p in ref_sample],
+            ref["symbols"],
+            sorted(set(ref["symbols"])),
+            temperature,
+        )
         self.cutoffs_bohr = self.scales["cutoff"]
         self.triplet_type_names = enumerate_triplet_types(self.elements, self.cutoffs_bohr)
         print(
@@ -318,25 +361,34 @@ class DFTDataset:
             f"triplet types: {len(self.triplet_type_names)}"
         )
 
-        fit_mask = torch.tensor(self.fit_mask, dtype=torch.bool)
         print("\nBuilding graphs...")
         self.graphs = []
-        for positions_bohr, forces_au in zip(self.positions, self.forces):
-            edges = build_edges(positions_bohr, self.symbols, self.cutoffs_bohr)
-            if not edges:
-                continue
-            triplets = build_triplets(edges, self.symbols, self.triplet_type_names)
-            positions = torch.tensor(np.asarray(positions_bohr), dtype=torch.float64)
-            dft_forces = (
-                torch.tensor(forces_au, dtype=torch.float64)
-                if forces_au is not None
-                else torch.zeros_like(positions)
+        self.graphs_per_dataset = []
+        for ds in self._datasets:
+            symbols   = ds["symbols"]
+            fit_mask  = torch.tensor(
+                [e in INORGANIC for e in symbols], dtype=torch.bool
             )
-            self.graphs.append({
-                "positions": positions,
-                "dft_forces": dft_forces,
-                "fit_mask": fit_mask,
-                "edges": edges,
-                "triplets": triplets,
-            })
+            qd_graphs = []
+            for positions_bohr, forces_au in zip(ds["positions"], ds["forces"]):
+                edges = build_edges(positions_bohr, symbols, self.cutoffs_bohr)
+                if not edges:
+                    continue
+                triplets = build_triplets(edges, symbols, self.triplet_type_names)
+                positions_t = torch.tensor(np.asarray(positions_bohr), dtype=torch.float64)
+                dft_forces = (
+                    torch.tensor(forces_au, dtype=torch.float64)
+                    if forces_au is not None
+                    else torch.zeros_like(positions_t)
+                )
+                graph = {
+                    "positions":  positions_t,
+                    "dft_forces": dft_forces,
+                    "fit_mask":   fit_mask,
+                    "edges":      edges,
+                    "triplets":   triplets,
+                }
+                self.graphs.append(graph)
+                qd_graphs.append(graph)
+            self.graphs_per_dataset.append(qd_graphs)
         print(f"done ({len(self.graphs)} graphs)")
