@@ -1,3 +1,9 @@
+"""
+Write fitted SW parameters to a LAMMPS .sw file.
+
+v31 change from v29: A, B, p, q, gamma are now per-bond direct fit parameters
+(not derived from r_min). They are read directly from params.
+"""
 import math
 import os
 
