@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from matplotlib.colors import LogNorm
 
 from .data import make_batch
-from .models import sw_forces
+from .models import sw_forces, bond_sigma
 from .utils import BOHR_TO_ANGSTROM, FORCE_AU_TO_EV_ANG, HARTREE_TO_EV, canonical_pair
 
 
@@ -34,17 +34,11 @@ PLOT_COLORS = ["#1f77b4", "#ff7f0e", "#9467bd", "#8c564b",
 
 
 def plot_sw_potentials(params, scales, filepath):
-    """
-    Two-panel figure:
-      Left:  V2(r) in eV — one curve per bond type.
-      Right: V3(theta) at r=r0 — one curve per triplet type.
-    """
+
     eps        = params["eps"]
     raw_lam    = params["raw_lam"]
     raw_theta0 = params["raw_theta0"]
-    sigma      = params["sigma"]
     r0         = params["r0"]
-    cutoff     = params["cutoff"]
 
     bond_names    = sorted(eps.keys())
     triplet_names = sorted(raw_theta0.keys())
@@ -52,13 +46,13 @@ def plot_sw_potentials(params, scales, filepath):
     fig, (ax_v2, ax_v3) = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle("Stillinger–Weber 2-body potential and 3-body angular term", fontsize=13)
 
-    # --- V2(r) ---
+
     r_ang_grid = np.linspace(1.5, 7.5, 5000)
     v2_min_all = 0.0
 
     for color, bond in zip(PLOT_COLORS, bond_names):
-        cutoff_bohr = float(cutoff[bond])
-        sigma_bohr  = float(sigma[bond])
+        sigma_bohr  = float(bond_sigma(bond, params))
+        cutoff_bohr = float(params["cutoff"][bond])
         cutoff_ang  = cutoff_bohr * BOHR_TO_ANGSTROM
         eps_ev      = float(eps[bond].item()) * HARTREE_TO_EV
         A_val       = math.exp(params["raw_A"][bond].item())
@@ -90,8 +84,8 @@ def plot_sw_potentials(params, scales, filepath):
     ax_v2.legend(fontsize=9)
     ax_v2.grid(alpha=0.3)
 
-    # --- V3(theta) at r = r0 ---
-    theta_deg  = np.linspace(30, 180, 1000)
+
+    theta_deg  = np.linspace(0, 180, 1000)
     cos_theta  = np.cos(np.radians(theta_deg))
     v3_max_all = 0.0
 
@@ -109,10 +103,11 @@ def plot_sw_potentials(params, scales, filepath):
 
         r0_ca    = float(r0[bond_ca])
         r0_cb    = float(r0[bond_cb])
-        cut_ca   = float(cutoff[bond_ca])
-        cut_cb   = float(cutoff[bond_cb])
-        sig_ca   = float(sigma[bond_ca])
-        sig_cb   = float(sigma[bond_cb])
+        sig_ca   = float(bond_sigma(bond_ca, params))
+        sig_cb   = float(bond_sigma(bond_cb, params))
+
+        cut_ca   = float(params["cutoff"][bond_ca])
+        cut_cb   = float(params["cutoff"][bond_cb])
         gamma_ca = F.softplus(params["raw_gamma"][bond_ca]).item()
         gamma_cb = F.softplus(params["raw_gamma"][bond_cb]).item()
         decay_ca = math.exp(gamma_ca * sig_ca / (r0_ca - cut_ca))
@@ -131,7 +126,7 @@ def plot_sw_potentials(params, scales, filepath):
     ax_v3.set_xlabel(r"Bond angle  $\theta$  (°)", fontsize=12)
     ax_v3.set_ylabel(r"$V_3(\theta)$  (eV)", fontsize=12)
     ax_v3.set_title(r"Three-body term at $r = r_\mathrm{eq}$", fontsize=12)
-    ax_v3.set_xlim(30, 180)
+    ax_v3.set_xlim(0, 180)
     ax_v3.set_ylim(-0.05, max(v3_max_all * 1.15, 0.1))
     ax_v3.legend(fontsize=9)
     ax_v3.grid(alpha=0.3)
