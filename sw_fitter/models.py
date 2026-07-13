@@ -1,69 +1,44 @@
-"""
-SW force model — v31.
-
-Compared with v29, this version removes the equilibrium-condition constraint that
-derived A and B analytically from r_min.  Instead A, B, p, q, gamma are all direct
-trainable parameters (per bond type).  sigma and cutoff (a) remain fixed from the
-dataset RDF.
-
-Trained per bond:
-    eps           (> 0, direct tensor clamped to min 1e-4)
-    raw_A         → A = exp(raw_A)               (A > 0)
-    raw_B         → B = softplus(raw_B)          (B > 0)
-    raw_p         → p = raw_p                   (unconstrained)
-    raw_q         → q = raw_q                   (unconstrained)
-    raw_gamma     → gamma = softplus(raw_gamma)  (gamma > 0)
-    raw_lam       → lam = exp(raw_lam)          (lam > 0)
-    raw_theta0    → cos(theta0) = tanh(raw_theta0)  (in [-1,1])
-
-Frozen:
-    sigma         (from RDF peak / SIGMA_RATIO in data.py)
-    cutoff        (= CUTOFF_RATIO * sigma in data.py)
-
-2-body form (full SW bracket):
-    V2(r) = A * eps * (B*(sigma/r)^p - (sigma/r)^q) * exp(sigma/(r - cutoff))
-
-    q=0 recovers the original SW bracket (B*(sigma/r)^p - 1 at r=sigma).
-    p and q are unconstrained so the optimizer can find non-bonding shapes freely.
-
-3-body form (unchanged from v29 except gamma is now per-bond):
-    V3 ~ lam_ca * lam_cb * exp(...) * (cos_theta - cos_theta0)^2
-"""
 import torch
 import torch.nn.functional as F
 
 from .utils import canonical_pair
 
+SIGMA_RATIO_MIN, SIGMA_RATIO_MAX = 1.0, 2.0
+SIGMA_FIXED_POINT_ITERS = 4
+
+
+def sw_sigma_ratio(B, a, p, q, n=100):
+    B = float(B); a = float(a); p = float(p); q = float(q)
+    x = torch.linspace(1.001, a - 1e-3, n, dtype=torch.float64)
+    ratio = float(x[torch.argmin((B * x ** (-p) - x ** (-q)) * torch.exp(1.0 / (x - a)))])
+    return min(max(ratio, SIGMA_RATIO_MIN), SIGMA_RATIO_MAX)
+
+
+def bond_sigma(bond, params):
+    B = F.softplus(params["raw_B"][bond])
+    p = params["raw_p"][bond]
+    q = params["raw_q"][bond]
+    cutoff_over_r0 = float(params["cutoff"][bond] / params["r0"][bond])
+    sigma_ratio = 1.12
+    for _ in range(SIGMA_FIXED_POINT_ITERS):
+        sigma_ratio = sw_sigma_ratio(B, cutoff_over_r0 * sigma_ratio, p, q)
+    return params["r0"][bond] / sigma_ratio
+
 
 def sw_2body_force(bond_length, eps, A, B, p, q, sigma, cutoff):
-    """
-    Force magnitude -dV2/dr (positive = repulsion).
-
-    V2 = A*eps*(B*(sigma/r)^p - (sigma/r)^q)*exp(sigma/(r-cutoff))
-    """
     sig_over_r = sigma / bond_length
-    bracket    = B * sig_over_r**p - sig_over_r**q
-    d_bracket  = (p * B * sig_over_r**p - q * sig_over_r**q) / bond_length
-    inv_gap    = 1.0 / (bond_length - cutoff)   # negative because r < cutoff always
+    bracket    = B * sig_over_r ** p - sig_over_r ** q
+    d_bracket  = (p * B * sig_over_r ** p - q * sig_over_r ** q) / bond_length
+    inv_gap    = 1.0 / (bond_length - cutoff).clamp(max=-1e-9)
     decay      = torch.exp(sigma * inv_gap)
-    return A * eps * decay * (d_bracket + bracket * sigma * inv_gap**2)
+    return A * eps * decay * (d_bracket + bracket * sigma * inv_gap ** 2)
 
 
-def sw_3body_forces(
-    vec_ca, vec_cb,
-    strength, cos_theta0,
-    gamma_sigma_ca, gamma_sigma_cb,
-    cutoff_ca, cutoff_cb,
-):
-    length_ca = vec_ca.norm(dim=1)
-    length_cb = vec_cb.norm(dim=1)
-    cos_theta  = (vec_ca * vec_cb).sum(dim=1) / (length_ca * length_cb)
-
+def sw_3body_forces(vec_ca, vec_cb, length_ca, length_cb, cos_theta,
+                    strength, cos_theta0, gamma_sigma_ca, gamma_sigma_cb, cutoff_ca, cutoff_cb):
     gap_ca = (length_ca - cutoff_ca).clamp(max=-1e-9)
     gap_cb = (length_cb - cutoff_cb).clamp(max=-1e-9)
-    decay_ca     = torch.exp(gamma_sigma_ca / gap_ca)
-    decay_cb     = torch.exp(gamma_sigma_cb / gap_cb)
-    energy_scale = strength * decay_ca * decay_cb
+    energy_scale = strength * torch.exp(gamma_sigma_ca / gap_ca) * torch.exp(gamma_sigma_cb / gap_cb)
 
     angle_term = cos_theta - cos_theta0
     radial     = energy_scale * angle_term ** 2
@@ -84,63 +59,62 @@ def sw_3body_forces(
     return force_a, force_b
 
 
-def two_body_forces(positions, edges_by_type, params):
+def two_body_forces(graph, params, sigma_by_bond):
+    positions = graph["positions"]
     forces = torch.zeros_like(positions)
-    for bond in edges_by_type:
-        atom_i, atom_j = edges_by_type[bond]
-        bond_vector = positions[atom_j] - positions[atom_i]
-        bond_length = bond_vector.norm(dim=1)
-
-        A = torch.exp(params["raw_A"][bond])
-        B = F.softplus(params["raw_B"][bond])
-        p = params["raw_p"][bond]     # unconstrained
-        q = params["raw_q"][bond]     # unconstrained
-
+    for bond, (atom_i, atom_j) in graph["edges"].items():
+        sigma = sigma_by_bond[bond]
+        bond_length = graph["edge_len"][bond]
         force_magnitude = sw_2body_force(
             bond_length,
             params["eps"][bond],
-            A, B, p, q,
-            params["sigma"][bond],
+            torch.exp(params["raw_A"][bond]),
+            F.softplus(params["raw_B"][bond]),
+            params["raw_p"][bond],
+            params["raw_q"][bond],
+            sigma,
             params["cutoff"][bond],
         )
+        bond_vector = positions[atom_j] - positions[atom_i]
         bond_force = (force_magnitude / bond_length).unsqueeze(1) * bond_vector
-        forces = forces.index_add(0, atom_i, -bond_force)
-        forces = forces.index_add(0, atom_j,  bond_force)
+        forces = forces.index_add(0, atom_i, -bond_force).index_add(0, atom_j, bond_force)
     return forces
 
 
-def three_body_forces(positions, triplets_by_type, params):
+def three_body_forces(graph, params, sigma_by_bond):
+    positions = graph["positions"]
     forces = torch.zeros_like(positions)
-    for triplet_name in triplets_by_type:
-        centre_idx, a_idx, b_idx = triplets_by_type[triplet_name]
+    for triplet_name, (centre_idx, a_idx, b_idx) in graph["triplets"].items():
         centre, legs = triplet_name.split(":")
         leg_a, leg_b = legs.split("-")
         bond_ca = canonical_pair(centre, leg_a)
         bond_cb = canonical_pair(centre, leg_b)
 
-        lam_ca     = torch.exp(params["raw_lam"][bond_ca])
-        lam_cb     = torch.exp(params["raw_lam"][bond_cb])
-        strength   = torch.sqrt(lam_ca * lam_cb)
+        strength = torch.sqrt(
+            torch.exp(params["raw_lam"][bond_ca]) * params["eps"][bond_ca]
+            * torch.exp(params["raw_lam"][bond_cb]) * params["eps"][bond_cb]
+        )
         cos_theta0 = torch.tanh(params["raw_theta0"][triplet_name])
-        gamma_ca   = F.softplus(params["raw_gamma"][bond_ca])
-        gamma_cb   = F.softplus(params["raw_gamma"][bond_cb])
+        gamma_ca = F.softplus(params["raw_gamma"][bond_ca])
+        gamma_cb = F.softplus(params["raw_gamma"][bond_cb])
+        sigma_ca = sigma_by_bond[bond_ca]
+        sigma_cb = sigma_by_bond[bond_cb]
+
+        length_ca, length_cb, cos_theta = graph["tri_len"][triplet_name]
+        vec_ca = positions[a_idx] - positions[centre_idx]
+        vec_cb = positions[b_idx] - positions[centre_idx]
 
         force_a, force_b = sw_3body_forces(
-            positions[a_idx]      - positions[centre_idx],
-            positions[b_idx]      - positions[centre_idx],
+            vec_ca, vec_cb, length_ca, length_cb, cos_theta,
             strength, cos_theta0,
-            gamma_ca * params["sigma"][bond_ca],
-            gamma_cb * params["sigma"][bond_cb],
-            params["cutoff"][bond_ca],
-            params["cutoff"][bond_cb],
+            gamma_ca * sigma_ca, gamma_cb * sigma_cb,
+            params["cutoff"][bond_ca], params["cutoff"][bond_cb],
         )
-        forces = forces.index_add(0, a_idx,       force_a)
-        forces = forces.index_add(0, b_idx,       force_b)
-        forces = forces.index_add(0, centre_idx, -(force_a + force_b))
+        forces = forces.index_add(0, a_idx, force_a).index_add(0, b_idx, force_b) \
+                       .index_add(0, centre_idx, -(force_a + force_b))
     return forces
 
 
 def sw_forces(graph, params):
-    two   = two_body_forces(  graph["positions"], graph["edges"],    params)
-    three = three_body_forces(graph["positions"], graph["triplets"], params)
-    return two + three
+    sigma_by_bond = {bond: bond_sigma(bond, params) for bond in params["eps"]}
+    return two_body_forces(graph, params, sigma_by_bond) + three_body_forces(graph, params, sigma_by_bond)
