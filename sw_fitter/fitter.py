@@ -9,13 +9,13 @@ import torch.nn.functional as F
 import yaml
 
 from .data import DFTDataset, make_batch
-from .models import sw_forces
+from .models import sw_forces, bond_sigma
 from .utils import BOHR_TO_ANGSTROM, EV_TO_HARTREE, FORCE_AU_TO_EV_ANG, HARTREE_TO_EV, canonical_triplet
 
 BOLTZMANN_EV  = 8.617333e-5
-GAMMA_INIT    = 1.2     # SW literature — starting point for gamma per bond
-P_INIT        = 4.0     # SW literature — starting point for p per bond
-Q_INIT        = 0.0     # standard SW  — starting point for q per bond
+GAMMA_INIT    = 1.2
+P_INIT        = 4.0
+Q_INIT        = 0.0
 
 
 def load_config(filepath):
@@ -33,29 +33,21 @@ def force_rmse(predicted, target):
 
 
 def softplus_inv(y):
-    """Inverse of softplus: x such that softplus(x) = y > 0."""
+
     return math.log(math.expm1(max(y, 1e-6)))
 
 
-# ---------------------------------------------------------------------------
-# Analytical helpers — used only to seed A and B; not a constraint during training.
-# ---------------------------------------------------------------------------
-
 def _b_init(r0, sigma, cutoff):
-    """B at the equilibrium condition dV2/dr=0 with p=4, q=0."""
+
     gap_sq = (r0 - cutoff) ** 2
     return (r0 / sigma) ** 4 / (1.0 + 4.0 * gap_sq / (sigma * r0))
 
 
 def _a_init(r0, sigma, cutoff, b):
-    """A so that V2(r0) = -eps with p=4, q=0."""
+
     bracket = b * (sigma / r0) ** 4 - 1.0
     return -1.0 / (bracket * math.exp(sigma / (r0 - cutoff)))
 
-
-# ---------------------------------------------------------------------------
-# cos(theta0) and lambda seeds from dataset statistics
-# ---------------------------------------------------------------------------
 
 def gather_cos_samples(graphs, stride):
     samples = {}
@@ -83,7 +75,7 @@ def initial_cos_theta0(triplet_names, cos_samples):
 
 
 def initial_lam(scales, cos_samples, temperature):
-    """Per-bond lambda seed from angular equipartition using gamma=GAMMA_INIT."""
+
     lam_init = {}
     for bond in scales["cutoff"]:
         elem_a, elem_b = bond.split("-")
@@ -107,10 +99,6 @@ def initial_lam(scales, cos_samples, temperature):
     return lam_init
 
 
-# ---------------------------------------------------------------------------
-# Parameter initialisation
-# ---------------------------------------------------------------------------
-
 def initialise_parameters(dataset, temperature, log):
     stride          = max(1, len(dataset.graphs) // 200)
     cos_samples     = gather_cos_samples(dataset.graphs, stride)
@@ -120,7 +108,7 @@ def initialise_parameters(dataset, temperature, log):
     bonds    = list(dataset.cutoffs_bohr.keys())
     triplets = list(dataset.triplet_type_names)
 
-    # eps — equipartition seed (same as v29)
+
     eps = {
         bond: torch.tensor(
             dataset.scales["eps_init"][bond], dtype=torch.float64, requires_grad=True
@@ -128,7 +116,7 @@ def initialise_parameters(dataset, temperature, log):
         for bond in bonds
     }
 
-    # A and B — seeded from analytical equilibrium values but trained freely.
+
     raw_A, raw_B = {}, {}
     for bond in bonds:
         r0, sigma, cutoff = (dataset.scales[k][bond]
@@ -140,25 +128,25 @@ def initialise_parameters(dataset, temperature, log):
         raw_B[bond] = torch.tensor(softplus_inv(max(b0, 1e-3)),
                                    dtype=torch.float64, requires_grad=True)
 
-    # p — per bond, unconstrained, init at literature value 4.0
+
     raw_p = {
         bond: torch.tensor(P_INIT, dtype=torch.float64, requires_grad=True)
         for bond in bonds
     }
 
-    # q — per bond, unconstrained, init at 0.0 (standard SW, recovers original bracket)
+
     raw_q = {
         bond: torch.tensor(Q_INIT, dtype=torch.float64, requires_grad=True)
         for bond in bonds
     }
 
-    # gamma — per bond, > 0 via softplus, init at literature value 1.2
+
     raw_gamma = {
         bond: torch.tensor(softplus_inv(GAMMA_INIT), dtype=torch.float64, requires_grad=True)
         for bond in bonds
     }
 
-    # lambda — equipartition seed
+
     raw_lam = {
         bond: torch.tensor(
             math.log(max(lam_init[bond], 1e-10)), dtype=torch.float64, requires_grad=True
@@ -166,7 +154,7 @@ def initialise_parameters(dataset, temperature, log):
         for bond in bonds
     }
 
-    # cos(theta0) — from DFT mean angle
+
     raw_theta0 = {
         triplet: torch.tensor(
             math.atanh(cos_theta0_init[triplet]), dtype=torch.float64, requires_grad=True
@@ -176,10 +164,11 @@ def initialise_parameters(dataset, temperature, log):
 
     log("\nInitial parameters:")
     log("  Trained:  eps, A, B, p, q, gamma, lambda, theta0")
-    log("  Frozen:   sigma, cutoff")
+    log("  Fixed:    cutoff (TAIL_FACTOR x RDF first-min);  sigma dynamic (pins well min at r0)")
     log(f"\n  {'Bond':>8}  {'eps (eV)':>10}  {'A':>8}  {'B':>8}  "
-        f"{'p':>5}  {'q':>5}  {'gamma':>6}  {'lam (eV)':>10}")
+        f"{'p':>5}  {'q':>5}  {'gamma':>6}  {'lam (eV)':>10}  {'cutoff (Å)':>11}")
     for bond in sorted(bonds):
+        cutoff_ang = dataset.scales["cutoff"][bond] * BOHR_TO_ANGSTROM
         log(f"  {bond:>8}  "
             f"{eps[bond].item()*HARTREE_TO_EV:>10.4f}  "
             f"{math.exp(raw_A[bond].item()):>8.4f}  "
@@ -187,7 +176,8 @@ def initialise_parameters(dataset, temperature, log):
             f"{raw_p[bond].item():>5.2f}  "
             f"{raw_q[bond].item():>5.2f}  "
             f"{F.softplus(raw_gamma[bond]).item():>6.4f}  "
-            f"{math.exp(raw_lam[bond].item())*HARTREE_TO_EV:>10.4f}")
+            f"{math.exp(raw_lam[bond].item())*HARTREE_TO_EV:>10.4f}  "
+            f"{cutoff_ang:>11.4f}")
     log("\n  cos_theta0 init (from DFT mean angle):")
     for name in sorted(cos_theta0_init):
         cos_val   = cos_theta0_init[name]
@@ -209,15 +199,8 @@ def initialise_parameters(dataset, temperature, log):
     }
 
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-
 def epoch_rmse(batches_per_qd, params, train, optimizer=None):
-    """
-    Compute RMSE as the mean of per-QD RMSEs so every dataset contributes equally
-    regardless of how many atoms each QD contains.
-    """
+
     qd_order = list(range(len(batches_per_qd)))
     if train:
         random.shuffle(qd_order)
@@ -240,6 +223,8 @@ def epoch_rmse(batches_per_qd, params, train, optimizer=None):
                 with torch.no_grad():
                     for bond in params["eps"]:
                         params["eps"][bond].clamp_(min=1e-4)
+                        params["raw_p"][bond].clamp_(min=0.0)
+                        params["raw_q"][bond].clamp_(min=0.0)
             qd_total += loss.item()
         qd_rmses.append(qd_total / len(qd_batches))
     return sum(qd_rmses) / len(qd_rmses) * FORCE_AU_TO_EV_ANG
@@ -259,7 +244,8 @@ def train(config, output_dir):
     training    = config["training"]
     temperature = training.get("training_temperature", 650)
 
-    dataset = DFTDataset(config["datasets"], first_n_frames=training.get("first_n_frames"))
+    dataset = DFTDataset(config["datasets"], config["scope"],
+                         first_n_frames=training.get("first_n_frames"))
     t_after_load = time.time()
     dataset.build_graphs(temperature=temperature)
     t_after_graphs = time.time()
@@ -293,7 +279,7 @@ def train(config, output_dir):
         lr=training["learning_rate"],
     )
     max_epochs = training["max_epochs"]
-    min_lr     = training.get("min_lr", 1e-4)
+    min_lr     = float(training.get("min_lr", 1e-4))
     scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max_epochs, eta_min=min_lr
     )
@@ -370,6 +356,7 @@ def write_outputs(results_dir, dataset, params, best_val,
                   train_history, val_history, config, log):
     final = {}
     for bond in params["raw_A"]:
+        a_val = float(params["cutoff"][bond] / bond_sigma(bond, params))
         final[bond] = {
             "eps_eV": params["eps"][bond].item() * HARTREE_TO_EV,
             "A":      math.exp(params["raw_A"][bond].item()),
@@ -378,19 +365,21 @@ def write_outputs(results_dir, dataset, params, best_val,
             "q":      params["raw_q"][bond].item(),
             "gamma":  F.softplus(params["raw_gamma"][bond]).item(),
             "lam_eV": math.exp(params["raw_lam"][bond].item()) * HARTREE_TO_EV,
+            "a":      a_val,
         }
     final_cos_theta0 = {
         t: math.tanh(params["raw_theta0"][t].item())
         for t in params["raw_theta0"]
     }
 
-    log(f"\n{'=' * 60}\nFITTED PARAMETERS — v31\n{'=' * 60}")
+    log(f"\n{'=' * 60}\nFITTED PARAMETERS — v33\n{'=' * 60}")
     log(f"  {'Bond':>8}  {'eps (eV)':>10}  {'A':>8}  {'B':>8}  "
-        f"{'p':>6}  {'q':>6}  {'gamma':>7}  {'lam (eV)':>10}")
+        f"{'p':>6}  {'q':>6}  {'gamma':>7}  {'lam (eV)':>10}  {'a':>7}")
     for bond in sorted(final):
         d = final[bond]
         log(f"  {bond:>8}  {d['eps_eV']:>10.4f}  {d['A']:>8.4f}  {d['B']:>8.4f}  "
-            f"  {d['p']:>6.3f}  {d['q']:>6.3f}  {d['gamma']:>7.4f}  {d['lam_eV']:>10.4f}")
+            f"  {d['p']:>6.3f}  {d['q']:>6.3f}  {d['gamma']:>7.4f}  {d['lam_eV']:>10.4f}  "
+            f"{d['a']:>7.4f}")
     log("\n  Fitted cos_theta0 per triplet:")
     for triplet in sorted(final_cos_theta0):
         cos_val   = final_cos_theta0[triplet]
@@ -399,13 +388,13 @@ def write_outputs(results_dir, dataset, params, best_val,
 
     torch.save(
         {
-            "final":          final,
+            "final":            final,
             "final_cos_theta0": final_cos_theta0,
-            "scales":         dataset.scales,
-            "best_rmse":      best_val,
-            "config":         config,
-            "train_history":  train_history,
-            "val_history":    val_history,
+            "scales":           dataset.scales,
+            "best_rmse":        best_val,
+            "config":           config,
+            "train_history":    train_history,
+            "val_history":      val_history,
         },
         os.path.join(results_dir, "checkpoint.pt"),
     )
@@ -424,7 +413,7 @@ def write_outputs(results_dir, dataset, params, best_val,
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="SW fitter v31: trains A, B, p, q, gamma, eps, lam, theta0 per bond"
+        description="SW fitter v33: trains A, B, p, q, gamma, eps, lam, theta0, a per bond"
     )
     parser.add_argument("config", help="config YAML")
     parser.add_argument("--output-dir", default=None)
