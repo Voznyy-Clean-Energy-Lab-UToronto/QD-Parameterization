@@ -1,14 +1,9 @@
-"""
-Write fitted SW parameters to a LAMMPS .sw file.
-
-v31 change from v29: A, B, p, q, gamma are now per-bond direct fit parameters
-(not derived from r_min). They are read directly from params.
-"""
 import math
 import os
 
 import torch.nn.functional as F
 
+from .models import bond_sigma
 from .utils import BOHR_TO_ANGSTROM, HARTREE_TO_EV, canonical_pair, canonical_triplet
 
 
@@ -20,7 +15,7 @@ def export_lammps(results_dir, dataset, params, formula):
     sw_filename = f"{formula}.sw"
     filepath    = os.path.join(results_dir, sw_filename)
     with open(filepath, "w") as f:
-        f.write("# Stillinger-Weber v31: A, B, p, q, gamma, eps, lambda, theta0 all trained\n")
+        f.write("# Stillinger-Weber v33: A, B, p, q, gamma, eps, lambda, theta0, a all trained\n")
         f.write(f"# SW elements: {sw_elements}\n")
         f.write(f"# LAMMPS pair_coeff * * {sw_filename} " + " ".join(sw_elements) + "\n")
         f.write("# i j k  eps sigma a lambda gamma cos0 A B p q tol\n")
@@ -40,10 +35,9 @@ def _sw_line(ei, ej, ek, params, triplet_types):
 
     if bond_ik in params["eps"]:
         eps_ev    = params["eps"][bond_ik].item() * HARTREE_TO_EV
-        sigma_ang = params["sigma"][bond_ik] * BOHR_TO_ANGSTROM
-        cutoff_b  = params["cutoff"][bond_ik]
-        sigma_b   = params["sigma"][bond_ik]
-        a_val     = cutoff_b / sigma_b            # LAMMPS 'a' = cutoff / sigma
+        sigma_bohr = bond_sigma(bond_ik, params)
+        sigma_ang = sigma_bohr * BOHR_TO_ANGSTROM
+        a_val     = float(params["cutoff"][bond_ik] / sigma_bohr)
         A_val     = math.exp(params["raw_A"][bond_ik].item())
         B_val     = F.softplus(params["raw_B"][bond_ik]).item()
         p_val     = params["raw_p"][bond_ik].item()
@@ -62,8 +56,9 @@ def _sw_line(ei, ej, ek, params, triplet_types):
     if parameterized:
         lam_ij     = math.exp(params["raw_lam"][bond_ij].item())
         lam_ik     = math.exp(params["raw_lam"][bond_ik].item())
+        eps_ij     = params["eps"][bond_ij].item()
         eps_ik     = params["eps"][bond_ik].item()
-        lam_lammps = math.sqrt(lam_ij * lam_ik) / max(abs(eps_ik), 1e-12)
+        lam_lammps = math.sqrt(lam_ij * eps_ij * lam_ik * eps_ik) / max(abs(eps_ik), 1e-12)
         cos0       = math.tanh(params["raw_theta0"][triplet_name].item())
     else:
         lam_lammps, cos0 = 0.0, -1.0 / 3.0
