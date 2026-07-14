@@ -20,8 +20,7 @@ def plot_training(train_history, val_history, filepath):
     ax.plot(range(1, len(val_history) + 1), val_history, label="validation")
     ax.set_xlabel("epoch")
     ax.set_ylabel("force RMSE (eV/Angstrom)")
-    ax.set_title(f"best validation RMSE = {min(val_history):.4f} eV/Angstrom"
-                 if val_history else "training curves")
+    ax.set_title(f"best validation RMSE = {min(val_history):.4f} eV/Angstrom")
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
@@ -33,8 +32,7 @@ PLOT_COLORS = ["#1f77b4", "#ff7f0e", "#9467bd", "#8c564b",
                "#2ca02c", "#d62728", "#17becf", "#bcbd22"]
 
 
-def plot_sw_potentials(params, scales, filepath):
-
+def plot_sw_potentials(params, filepath):
     eps        = params["eps"]
     raw_lam    = params["raw_lam"]
     raw_theta0 = params["raw_theta0"]
@@ -95,8 +93,6 @@ def plot_sw_potentials(params, scales, filepath):
         bond_ca = canonical_pair(centre, leg_a)
         bond_cb = canonical_pair(centre, leg_b)
 
-        if bond_ca not in raw_lam or bond_cb not in raw_lam:
-            continue
         lam_ca   = math.exp(raw_lam[bond_ca].item())
         lam_cb   = math.exp(raw_lam[bond_cb].item())
         strength = math.sqrt(lam_ca * lam_cb) * HARTREE_TO_EV
