@@ -15,7 +15,7 @@ def export_lammps(results_dir, dataset, params, formula):
     sw_filename = f"{formula}.sw"
     filepath    = os.path.join(results_dir, sw_filename)
     with open(filepath, "w") as f:
-        f.write("# Stillinger-Weber v33: A, B, p, q, gamma, eps, lambda, theta0, a all trained\n")
+        f.write("# Stillinger-Weber: eps, A, B, p, q, gamma, lambda, theta0 trained; cutoff (a*sigma) fixed from RDF\n")
         f.write(f"# SW elements: {sw_elements}\n")
         f.write(f"# LAMMPS pair_coeff * * {sw_filename} " + " ".join(sw_elements) + "\n")
         f.write("# i j k  eps sigma a lambda gamma cos0 A B p q tol\n")
@@ -58,7 +58,7 @@ def _sw_line(ei, ej, ek, params, triplet_types):
         lam_ik     = math.exp(params["raw_lam"][bond_ik].item())
         eps_ij     = params["eps"][bond_ij].item()
         eps_ik     = params["eps"][bond_ik].item()
-        lam_lammps = math.sqrt(lam_ij * eps_ij * lam_ik * eps_ik) / max(abs(eps_ik), 1e-12)
+        lam_lammps = math.sqrt(lam_ij * eps_ij * lam_ik * eps_ik) / eps_ik
         cos0       = math.tanh(params["raw_theta0"][triplet_name].item())
     else:
         lam_lammps, cos0 = 0.0, -1.0 / 3.0
