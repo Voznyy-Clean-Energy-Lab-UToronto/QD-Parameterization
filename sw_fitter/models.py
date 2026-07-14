@@ -118,3 +118,4 @@ def three_body_forces(graph, params, sigma_by_bond):
 def sw_forces(graph, params):
     sigma_by_bond = {bond: bond_sigma(bond, params) for bond in params["eps"]}
     return two_body_forces(graph, params, sigma_by_bond) + three_body_forces(graph, params, sigma_by_bond)
+    
