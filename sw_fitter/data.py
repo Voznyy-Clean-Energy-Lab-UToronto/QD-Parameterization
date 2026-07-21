@@ -13,24 +13,44 @@ from .utils import (
     canonical_triplet,
 )
 
-TAIL_FACTOR = 1.20
-BOND_MAX_ANG = 7.0
+TAIL_FACTOR = 1.20 #Virtual cutoff correction from Zhou paper (2013), multiplies the estimated bond distance from
+                   #RDF as bond distance * 1.2, to account for the approximate difference between a potential being ~0, but
+                   # prior to its true cutoff distance. Without this, the cutoff distance is too short, and modifies shape of
+                   # the well. 1.2 is chosen as an approximation
+BOND_MAX_ANG = 7.0 #Screen distance to search for bond distance from RDF (minima after first peak)
 
-def read_trajectory(filepath, first_n=None, skip_n=None):
+#reads the trajectory using ASE, assumes extxyz format. Regardless of DFT program please convert (and include forces).
+#can easily be done using DPData https://github.com/deepmodeling/dpdata
+def read_trajectory(filepath, first_n=None, skip_n=None, n_train=None, val_stride=1):
     frames = ase.io.read(filepath, index=":", format="extxyz")
     if skip_n:
-        frames = frames[skip_n:]
+        frames = frames[skip_n:] #skip first n number of frames from extxyz
     if first_n:
-        frames = frames[:first_n]
+        frames = frames[:first_n] #only train on first n number of frames (after skip_n). so skip_n = 500, first_n = 1000 means
+                                  #program is trained on frames [500, 1501]
 
+    is_train = None
+    if n_train is not None:
+        train_frames = frames[:n_train]
+        val_frames = frames[n_train::val_stride]
+        frames = train_frames + val_frames
+        is_train = [True] * len(train_frames) + [False] * len(val_frames)
+
+    #checks elements present from first frame and assumes this won't change. this program will not work if
+    # no. of each atom is changing
     symbols = frames[0].get_chemical_symbols()
+    #positions and frames lists are the entire trajectory in a list. each element of the list is
+    # (n_atoms, 3) for x,y,z or fx, fy, fz per atom, per frame. For 1,000 frames and 1,000 atoms, with would be ~0.5 gb memory
     positions = [frame.positions * ANGSTROM_TO_BOHR for frame in frames]
     forces = [frame.get_forces() / FORCE_AU_TO_EV_ANG for frame in frames]
-
     print(f"  {len(frames)} frames, {len(symbols)} atoms")
-    return symbols, positions, forces
+    return symbols, positions, forces, is_train
 
-
+#determines which pairwise interactions should be considered for training
+# not all interactions are trained. pure ligand interactions (eg. C-C, C-O, O-H etc.) are given
+# CHAMM36 parameters, and not trained at all. These untrained interactions will later be masked out of training, so they
+# do not influence the F_RMSE in training. This is because SW is not intended for training organics, and this also creates
+# a large computational cost, for results that are not significant to the program
 def is_candidate_pair(element_a, element_b, fit_elements, ligand_elements):
     scope = fit_elements | ligand_elements
     if element_a not in scope or element_b not in scope:
@@ -39,7 +59,6 @@ def is_candidate_pair(element_a, element_b, fit_elements, ligand_elements):
 
 
 def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_element):
-
     bond_max_bohr = BOND_MAX_ANG * ANGSTROM_TO_BOHR
     bin_edges = np.linspace(1.5 * ANGSTROM_TO_BOHR, bond_max_bohr, 100)
     bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -72,13 +91,11 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
     return r0_bohr, first_min_bohr, coordination
 
 
-def measure_pair_scales(sampled_positions_bohr, symbols, elements, fit_elements, ligand_elements):
+def measure_pair_geometry(sampled_positions_bohr, symbols, elements, fit_elements, ligand_elements):
     symbols = np.array(symbols)
     atoms_of_element = {e: np.where(symbols == e)[0] for e in elements}
 
-    scales = {field: {} for field in ("r0", "cutoff")}
-
-    print("\n2-body scales (r0 and first-shell minimum measured from RDF):")
+    geometry_by_bond = {}
     for element_a, element_b in combinations_with_replacement(elements, 2):
         if not is_candidate_pair(element_a, element_b, fit_elements, ligand_elements):
             continue
@@ -94,18 +111,41 @@ def measure_pair_scales(sampled_positions_bohr, symbols, elements, fit_elements,
         if geometry is None:
             continue
         r0_bohr, first_min_bohr, coordination = geometry
-        bond = canonical_pair(element_a, element_b)
-
         if coordination < 0.05 or not (first_min_bohr > r0_bohr > 0):
-            print(f"  {bond:>8}: no clear bond (coordination={coordination:.2f}) — skipped")
             continue
+        geometry_by_bond[canonical_pair(element_a, element_b)] = (r0_bohr, first_min_bohr)
+    return geometry_by_bond
 
-        scales["r0"][bond] = r0_bohr
+
+def measure_pair_scales_all_datasets(datasets, fit_elements, ligand_elements):
+    observations = {}
+    for ds in datasets:
+        n_tr = sum(ds["is_train"]) if ds.get("is_train") is not None else len(ds["positions"])
+        train_positions = ds["positions"][:n_tr]
+        sample = train_positions[:: max(1, len(train_positions) // 50)]
+        geometry_by_bond = measure_pair_geometry(
+            [np.asarray(p) for p in sample],
+            ds["symbols"],
+            sorted(set(ds["symbols"])),
+            fit_elements,
+            ligand_elements,
+        )
+        for bond, (r0_bohr, first_min_bohr) in geometry_by_bond.items():
+            observations.setdefault(bond, []).append((ds["name"], r0_bohr, first_min_bohr))
+
+    scales = {"r0": {}, "cutoff": {}}
+    print("\n2-body scales (global r0 and cutoff = median over datasets showing a clear bond):")
+    for bond in sorted(observations):
+        entries        = observations[bond]
+        contributors   = [name for name, _, _ in entries]
+        r0_bohr        = float(np.median([r0 for _, r0, _ in entries]))
+        first_min_bohr = float(np.median([fm for _, _, fm in entries]))
+        scales["r0"][bond]     = r0_bohr
         scales["cutoff"][bond] = TAIL_FACTOR * first_min_bohr
-
         print(
             f"  {bond:>8}: r0={r0_bohr * BOHR_TO_ANGSTROM:.3f} Å  "
-            f"cutoff={scales['cutoff'][bond] * BOHR_TO_ANGSTROM:.3f} Å"
+            f"cutoff={scales['cutoff'][bond] * BOHR_TO_ANGSTROM:.3f} Å  "
+            f"from {len(contributors)}/{len(datasets)} dataset(s): {contributors}"
         )
     return scales
 
@@ -237,7 +277,7 @@ def make_batch(frames):
 
 
 class DFTDataset:
-    def __init__(self, dataset_configs, scope, first_n_frames=None):
+    def __init__(self, dataset_configs, scope, first_n_frames=None, n_train=None, val_stride=1):
         print(f"\n{'=' * 60}\nLOADING DATA\n{'=' * 60}")
 
         self.fit_elements = set(scope["fit_elements"])
@@ -246,16 +286,19 @@ class DFTDataset:
         self._datasets = []
         for cfg in dataset_configs:
             print(f"\n{cfg.get('name', cfg['xyz'])}")
-            symbols, positions, forces = read_trajectory(
+            symbols, positions, forces, is_train = read_trajectory(
                 cfg["xyz"],
                 first_n=cfg.get("first_n_frames", first_n_frames),
                 skip_n=cfg.get("skip_frames"),
+                n_train=n_train,
+                val_stride=val_stride,
             )
             self._datasets.append({
                 "name":      cfg.get("name", ""),
                 "symbols":   symbols,
                 "positions": positions,
                 "forces":    forces,
+                "is_train":  is_train,
             })
 
         self.elements = sorted({e for ds in self._datasets for e in ds["symbols"]})
@@ -269,14 +312,8 @@ class DFTDataset:
 
     def build_graphs(self):
 
-        ref = self._datasets[0]
-        ref_sample = ref["positions"][:: max(1, len(ref["positions"]) // 50)]
-        self.scales = measure_pair_scales(
-            [np.asarray(p) for p in ref_sample],
-            ref["symbols"],
-            sorted(set(ref["symbols"])),
-            self.fit_elements,
-            self.ligand_elements,
+        self.scales = measure_pair_scales_all_datasets(
+            self._datasets, self.fit_elements, self.ligand_elements
         )
         self.cutoffs_bohr = self.scales["cutoff"]
         self.triplet_type_names = enumerate_triplet_types(self.elements, self.cutoffs_bohr, self.fit_elements)
@@ -296,8 +333,9 @@ class DFTDataset:
             fit_mask  = torch.tensor(
                 [e in self.fit_elements for e in symbols], dtype=torch.bool
             )
+            is_train_list = ds["is_train"] if ds["is_train"] is not None else [True] * len(ds["positions"])
             qd_graphs = []
-            for positions_bohr, forces_au in zip(ds["positions"], ds["forces"]):
+            for positions_bohr, forces_au, frame_is_train in zip(ds["positions"], ds["forces"], is_train_list):
                 edges = build_edges(positions_bohr, symbols, self.cutoffs_bohr)
                 if not edges:
                     continue
@@ -313,6 +351,7 @@ class DFTDataset:
                     "triplets":   triplets,
                     "edge_len":   edge_len,
                     "tri_len":    tri_len,
+                    "is_train":   frame_is_train,
                 }
                 self.graphs.append(graph)
                 qd_graphs.append(graph)
