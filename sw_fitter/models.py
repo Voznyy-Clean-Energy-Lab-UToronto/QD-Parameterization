@@ -90,9 +90,8 @@ def three_body_forces(graph, params, sigma_by_bond):
         bond_ca = canonical_pair(centre, leg_a)
         bond_cb = canonical_pair(centre, leg_b)
 
-        strength = torch.sqrt(
-            torch.exp(params["raw_lam"][bond_ca]) * params["eps"][bond_ca]
-            * torch.exp(params["raw_lam"][bond_cb]) * params["eps"][bond_cb]
+        strength = torch.exp(params["raw_lam"][triplet_name]) * torch.sqrt(
+            params["eps"][bond_ca] * params["eps"][bond_cb]
         )
         cos_theta0 = torch.tanh(params["raw_theta0"][triplet_name])
         gamma_ca = F.softplus(params["raw_gamma"][bond_ca])
@@ -118,4 +117,3 @@ def three_body_forces(graph, params, sigma_by_bond):
 def sw_forces(graph, params):
     sigma_by_bond = {bond: bond_sigma(bond, params) for bond in params["eps"]}
     return two_body_forces(graph, params, sigma_by_bond) + three_body_forces(graph, params, sigma_by_bond)
-    
