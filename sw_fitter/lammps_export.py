@@ -54,12 +54,11 @@ def _sw_line(ei, ej, ek, params, triplet_types):
                      and bond_ij in params["eps"]
                      and eps_ev > 1e-12)
     if parameterized:
-        lam_ij     = math.exp(params["raw_lam"][bond_ij].item())
-        lam_ik     = math.exp(params["raw_lam"][bond_ik].item())
-        eps_ij     = params["eps"][bond_ij].item()
-        eps_ik     = params["eps"][bond_ik].item()
-        lam_lammps = math.sqrt(lam_ij * eps_ij * lam_ik * eps_ik) / eps_ik
-        cos0       = math.tanh(params["raw_theta0"][triplet_name].item())
+        lam_triplet = math.exp(params["raw_lam"][triplet_name].item())
+        eps_ij      = params["eps"][bond_ij].item()
+        eps_ik      = params["eps"][bond_ik].item()
+        lam_lammps  = lam_triplet * math.sqrt(eps_ij / eps_ik)
+        cos0        = math.tanh(params["raw_theta0"][triplet_name].item())
     else:
         lam_lammps, cos0 = 0.0, -1.0 / 3.0
 
