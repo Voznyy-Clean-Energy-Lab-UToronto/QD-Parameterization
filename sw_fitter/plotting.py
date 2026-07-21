@@ -93,9 +93,10 @@ def plot_sw_potentials(params, filepath):
         bond_ca = canonical_pair(centre, leg_a)
         bond_cb = canonical_pair(centre, leg_b)
 
-        lam_ca   = math.exp(raw_lam[bond_ca].item())
-        lam_cb   = math.exp(raw_lam[bond_cb].item())
-        strength = math.sqrt(lam_ca * lam_cb) * HARTREE_TO_EV
+        lam_triplet = math.exp(raw_lam[triplet_name].item())
+        eps_ca      = float(eps[bond_ca].item())
+        eps_cb      = float(eps[bond_cb].item())
+        strength    = lam_triplet * math.sqrt(eps_ca * eps_cb) * HARTREE_TO_EV
 
         r0_ca    = float(r0[bond_ca])
         r0_cb    = float(r0[bond_cb])
