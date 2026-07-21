@@ -10,16 +10,17 @@ import yaml
 
 from .data import DFTDataset, make_batch
 from .models import sw_forces, bond_sigma
-from .utils import EV_TO_HARTREE, FORCE_AU_TO_EV_ANG, HARTREE_TO_EV, canonical_triplet
+from .utils import EV_TO_HARTREE, FORCE_AU_TO_EV_ANG, HARTREE_TO_EV, canonical_pair
 
 BOLTZMANN_EV  = 8.617333e-5
-GAMMA_INIT    = 1.2            #original SW-Si
-P_INIT        = 4.0            #original SW-Si
-Q_INIT        = 0.0            #original SW-Si
-A_INIT        = 7.049556       #original SW-Si
-B_INIT        = 0.602          #original SW-Si
-TETRAHEDRAL_COS = -1.0 / 3.0   #theta0 = 109.47 degrees (tetrahedral)
-SIGMA_RATIO   = 1.122          #r0/sigma at the generic SW well minimum; only seeds lambda
+GAMMA_INIT    = 1.2
+P_INIT        = 4.0
+Q_INIT        = 0.0
+A_INIT        = 7.049556
+B_INIT        = 0.602
+TETRAHEDRAL_COS = -1.0 / 3.0
+SIGMA_RATIO   = 1.122
+LAM_DEFAULT   = 1e-4
 
 TRAINABLE = ("eps", "raw_A", "raw_B", "raw_p", "raw_q", "raw_gamma", "raw_lam", "raw_theta0")
 
@@ -60,38 +61,62 @@ def gather_cos_samples(graphs, stride):
     return samples
 
 
-def initial_lam(scales, cos_samples, temperature):
+def leg_decay(scales, bond):
+    r0     = scales["r0"][bond]
+    sigma  = r0 / SIGMA_RATIO
+    cutoff = scales["cutoff"][bond]
+    return math.exp(GAMMA_INIT * sigma / (r0 - cutoff))
+
+
+def initial_lam(scales, cos_samples, triplet_names, temperature, eps_init_ev, eps_init_default):
+    kT_hartree = BOLTZMANN_EV * temperature * EV_TO_HARTREE
 
     lam_init = {}
-    for bond in scales["cutoff"]:
-        elem_a, elem_b = bond.split("-")
-        cos_vals = []
-        for name in [canonical_triplet(elem_a, elem_b, elem_b),
-                     canonical_triplet(elem_b, elem_a, elem_a)]:
-            cos_vals += cos_samples.get(name, [])
+    for triplet_name in triplet_names:
+        centre, legs = triplet_name.split(":")
+        leg_a, leg_b = legs.split("-")
+        bond_ca = canonical_pair(centre, leg_a)
+        bond_cb = canonical_pair(centre, leg_b)
 
+        cos_vals = cos_samples.get(triplet_name, [])
         if len(cos_vals) < 50:
-            lam_init[bond] = 1e-4 * EV_TO_HARTREE
+            lam_init[triplet_name] = LAM_DEFAULT
             continue
 
-        var_cos    = float(np.var(cos_vals))
-        r0         = scales["r0"][bond]
-        sigma      = r0 / SIGMA_RATIO
-        cutoff     = scales["cutoff"][bond]
-        decay_sq   = math.exp(GAMMA_INIT * sigma / (r0 - cutoff)) ** 2
-        kT_hartree = BOLTZMANN_EV * temperature * EV_TO_HARTREE
-        lam_init[bond] = kT_hartree / (2.0 * decay_sq * max(var_cos, 1e-8))
+        var_cos         = float(np.var(cos_vals))
+        decay_ca        = leg_decay(scales, bond_ca)
+        decay_cb        = leg_decay(scales, bond_cb)
+        strength_target = kT_hartree / (2.0 * decay_ca * decay_cb * max(var_cos, 1e-8))
+
+        eps_ca = eps_init_ev.get(bond_ca, eps_init_default) * EV_TO_HARTREE
+        eps_cb = eps_init_ev.get(bond_cb, eps_init_default) * EV_TO_HARTREE
+        lam_init[triplet_name] = strength_target / math.sqrt(eps_ca * eps_cb)
 
     return lam_init
 
 
+def initial_cos_theta0(triplet_names, cos_samples):
+    cos_theta0 = {}
+    for name in triplet_names:
+        samples = cos_samples.get(name, [])
+        if len(samples) > 20:
+            cos_theta0[name] = float(np.clip(np.mean(samples), -0.999, 0.999))
+        else:
+            cos_theta0[name] = TETRAHEDRAL_COS
+    return cos_theta0
+
+
 def initialise_parameters(dataset, temperature, eps_init_ev, eps_init_default):
-    stride          = max(1, len(dataset.graphs) // 200)
-    cos_samples     = gather_cos_samples(dataset.graphs, stride)
-    lam_init        = initial_lam(dataset.scales, cos_samples, temperature)
+    train_graphs    = [g for g in dataset.graphs if g.get("is_train", True)]
+    stride          = max(1, len(train_graphs) // 200)
+    cos_samples     = gather_cos_samples(train_graphs, stride)
 
     bonds    = list(dataset.cutoffs_bohr.keys())
     triplets = list(dataset.triplet_type_names)
+
+    lam_init        = initial_lam(dataset.scales, cos_samples, triplets, temperature,
+                                  eps_init_ev, eps_init_default)
+    cos_theta0_init = initial_cos_theta0(triplets, cos_samples)
 
     eps        = {b: trainable(eps_init_ev.get(b, eps_init_default) * EV_TO_HARTREE) for b in bonds}
     raw_A      = {b: trainable(math.log(A_INIT))                  for b in bonds}
@@ -99,8 +124,8 @@ def initialise_parameters(dataset, temperature, eps_init_ev, eps_init_default):
     raw_p      = {b: trainable(P_INIT)                            for b in bonds}
     raw_q      = {b: trainable(Q_INIT)                            for b in bonds}
     raw_gamma  = {b: trainable(softplus_inv(GAMMA_INIT))          for b in bonds}
-    raw_lam    = {b: trainable(math.log(max(lam_init[b], 1e-10))) for b in bonds}
-    raw_theta0 = {t: trainable(math.atanh(TETRAHEDRAL_COS))       for t in triplets}
+    raw_lam    = {t: trainable(math.log(max(lam_init[t], 1e-10))) for t in triplets}
+    raw_theta0 = {t: trainable(math.atanh(cos_theta0_init[t]))    for t in triplets}
 
     return {
         "eps":        eps,
@@ -162,7 +187,9 @@ def train(config, output_dir):
     temperature = training.get("training_temperature", 650)
 
     dataset = DFTDataset(config["datasets"], config["scope"],
-                         first_n_frames=training.get("first_n_frames"))
+                         first_n_frames=training.get("first_n_frames"),
+                         n_train=training.get("n_train_frames"),
+                         val_stride=training.get("val_stride", 1))
     t_after_load = time.time()
     dataset.build_graphs()
     t_after_graphs = time.time()
@@ -174,11 +201,15 @@ def train(config, output_dir):
     batch_size = training["batch_size"]
     val_frac   = training["validation_split"]
     train_batches_per_qd, val_batches_per_qd = [], []
-    log("\nPer-QD train/val split (last {:.0%} of each QD → val):".format(val_frac))
+    log("\nPer-QD train/val split (train = first n_train_frames, val = remainder):")
     for ds_cfg, qd_graphs in zip(dataset._datasets, dataset.graphs_per_dataset):
-        n_val_qd  = max(1, int(len(qd_graphs) * val_frac))
-        qd_train  = qd_graphs[:-n_val_qd]
-        qd_val    = qd_graphs[-n_val_qd:]
+        if training.get("n_train_frames") is not None:
+            qd_train = [g for g in qd_graphs if g["is_train"]]
+            qd_val   = [g for g in qd_graphs if not g["is_train"]]
+        else:
+            n_val_qd = max(1, int(len(qd_graphs) * val_frac))
+            qd_train = qd_graphs[:-n_val_qd]
+            qd_val   = qd_graphs[-n_val_qd:]
         train_batches_per_qd.append([make_batch(qd_train[i:i+batch_size])
                                      for i in range(0, len(qd_train), batch_size)])
         val_batches_per_qd.append([make_batch(qd_val[i:i+batch_size])
@@ -200,26 +231,32 @@ def train(config, output_dir):
     best_state  = None
     train_history, val_history = [], []
 
+    val_every = int(training.get("val_every", 1))
+    last_val  = float("inf")
+
     log(f"\n{'Epoch':>6} | {'Train':>10} | {'Val':>10} | {'LR':>9} | {'Elapsed':>9} | imp")
     for epoch in range(1, max_epochs + 1):
         train_rmse = epoch_rmse(train_batches_per_qd, params, train=True, optimizer=optimizer)
-        with torch.no_grad():
-            val_rmse = epoch_rmse(val_batches_per_qd, params, train=False)
         scheduler.step()
-        train_history.append(train_rmse)
-        val_history.append(val_rmse)
 
+        do_val   = (epoch % val_every == 0) or (epoch == max_epochs)
+        improved = False
+        if do_val:
+            with torch.no_grad():
+                last_val = epoch_rmse(val_batches_per_qd, params, train=False)
+            if last_val < best_val:
+                best_val   = last_val
+                best_state = {key: {name: t.item() for name, t in params[key].items()}
+                              for key in TRAINABLE}
+                improved = True
+
+        train_history.append(train_rmse)
+        val_history.append(last_val)
         current_lr = optimizer.param_groups[0]["lr"]
         elapsed    = time.time() - t_start
-        if val_rmse < best_val:
-            best_val  = val_rmse
-            best_state = {key: {name: t.item() for name, t in params[key].items()}
-                          for key in TRAINABLE}
-            log(f"{epoch:6d} | {train_rmse:10.6f} | {val_rmse:10.6f} | "
-                f"{current_lr:9.2e} | {elapsed:8.1f}s | *")
-        else:
-            log(f"{epoch:6d} | {train_rmse:10.6f} | {val_rmse:10.6f} | "
-                f"{current_lr:9.2e} | {elapsed:8.1f}s |  ")
+        mark = "*" if improved else ("." if not do_val else " ")
+        log(f"{epoch:6d} | {train_rmse:10.6f} | {last_val:10.6f} | "
+            f"{current_lr:9.2e} | {elapsed:8.1f}s | {mark}")
 
     t_after_train = time.time()
 
@@ -263,32 +300,49 @@ def write_outputs(results_dir, dataset, params, best_val,
             "p":      params["raw_p"][bond].item(),
             "q":      params["raw_q"][bond].item(),
             "gamma":  F.softplus(params["raw_gamma"][bond]).item(),
-            "lam_eV": math.exp(params["raw_lam"][bond].item()) * HARTREE_TO_EV,
             "a":      a_val,
         }
     final_cos_theta0 = {
         t: math.tanh(params["raw_theta0"][t].item())
         for t in params["raw_theta0"]
     }
+    final_lam = {}
+    for triplet in params["raw_lam"]:
+        centre, legs = triplet.split(":")
+        leg_a, leg_b = legs.split("-")
+        bond_ca = canonical_pair(centre, leg_a)
+        bond_cb = canonical_pair(centre, leg_b)
+        lam_value = math.exp(params["raw_lam"][triplet].item())
+        eps_ca    = params["eps"][bond_ca].item()
+        eps_cb    = params["eps"][bond_cb].item()
+        final_lam[triplet] = {
+            "lam":         lam_value,
+            "strength_eV": lam_value * math.sqrt(eps_ca * eps_cb) * HARTREE_TO_EV,
+        }
 
     log(f"\n{'=' * 60}\nFITTED PARAMETERS\n{'=' * 60}")
     log(f"  {'Bond':>8}  {'eps (eV)':>10}  {'A':>8}  {'B':>8}  "
-        f"{'p':>6}  {'q':>6}  {'gamma':>7}  {'lam (eV)':>10}  {'a':>7}")
+        f"{'p':>6}  {'q':>6}  {'gamma':>7}  {'a':>7}")
     for bond in sorted(final):
         d = final[bond]
         log(f"  {bond:>8}  {d['eps_eV']:>10.4f}  {d['A']:>8.4f}  {d['B']:>8.4f}  "
-            f"  {d['p']:>6.3f}  {d['q']:>6.3f}  {d['gamma']:>7.4f}  {d['lam_eV']:>10.4f}  "
+            f"  {d['p']:>6.3f}  {d['q']:>6.3f}  {d['gamma']:>7.4f}  "
             f"{d['a']:>7.4f}")
-    log("\n  Fitted cos_theta0 per triplet:")
+    log("\n  Fitted 3-body angular term per triplet "
+        "(lambda dimensionless; strength = lambda*sqrt(eps_ca*eps_cb)):")
+    log(f"    {'Triplet':>12}  {'lambda':>10}  {'strength (eV)':>14}  {'cos_theta0':>11}  {'theta0':>7}")
     for triplet in sorted(final_cos_theta0):
         cos_val   = final_cos_theta0[triplet]
         theta_deg = math.degrees(math.acos(float(np.clip(cos_val, -1.0, 1.0))))
-        log(f"    {triplet}: cos_theta0={cos_val:.4f}  (theta0={theta_deg:.1f}°)")
+        angular   = final_lam[triplet]
+        log(f"    {triplet:>12}  {angular['lam']:>10.4f}  {angular['strength_eV']:>14.5f}  "
+            f"{cos_val:>11.4f}  {theta_deg:>6.1f}°")
 
     torch.save(
         {
             "final":            final,
             "final_cos_theta0": final_cos_theta0,
+            "final_lam":        final_lam,
             "scales":           dataset.scales,
             "best_rmse":        best_val,
             "config":           config,
@@ -312,7 +366,7 @@ def write_outputs(results_dir, dataset, params, best_val,
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="SW fitter: trains eps, A, B, p, q, gamma, lambda, theta0 per bond (cutoff fixed from RDF)"
+        description="SW fitter: trains eps, A, B, p, q, gamma per bond and lambda, theta0 per triplet (cutoff fixed from RDF)"
     )
     parser.add_argument("config", help="config YAML")
     parser.add_argument("--output-dir", default=None)
