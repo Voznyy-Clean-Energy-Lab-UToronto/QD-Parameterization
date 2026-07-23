@@ -2,6 +2,7 @@ import math
 import os
 import random
 import time
+from functools import partial
 
 import numpy as np
 import torch
@@ -11,6 +12,7 @@ import yaml
 from .data import DFTDataset, make_batch
 from .models import sw_forces, bond_sigma
 from .utils import EV_TO_HARTREE, FORCE_AU_TO_EV_ANG, HARTREE_TO_EV, canonical_pair
+from . import __version__
 
 BOLTZMANN_EV  = 8.617333e-5
 GAMMA_INIT    = 1.2
@@ -23,11 +25,9 @@ SIGMA_RATIO   = 1.122
 LAM_DEFAULT   = 1e-4
 
 TRAINABLE = ("eps", "raw_A", "raw_B", "raw_p", "raw_q", "raw_gamma", "raw_lam", "raw_theta0")
-
-
 def load_config(filepath):
-    with open(filepath) as f:
-        config = yaml.safe_load(f)
+    with open(filepath, encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
     config_dir = os.path.dirname(os.path.abspath(filepath))
     for dataset in config.get("datasets", []):
         if "xyz" in dataset and not os.path.isabs(dataset["xyz"]):
@@ -39,25 +39,25 @@ def force_rmse(predicted, target):
     return torch.sqrt(((predicted - target) ** 2).mean())
 
 
-def softplus_inv(y):
-    return math.log(math.expm1(max(y, 1e-6)))
+def softplus_inv(positive_value):
+    return math.log(math.expm1(max(positive_value, 1e-6)))
 
 
 def trainable(value):
     return torch.tensor(value, dtype=torch.float64, requires_grad=True)
 
 
+def log_message(logfile, message):
+    print(message)
+    logfile.write(message + "\n")
+    logfile.flush()
+
+
 def gather_cos_samples(graphs, stride):
     samples = {}
     for graph in graphs[::stride]:
-        positions = graph["positions"]
-        for name, (centre, atom_a, atom_b) in graph["triplets"].items():
-            vec_ca = positions[atom_a] - positions[centre]
-            vec_cb = positions[atom_b] - positions[centre]
-            cos_theta = (
-                (vec_ca * vec_cb).sum(dim=1) / (vec_ca.norm(dim=1) * vec_cb.norm(dim=1))
-            ).clamp(-1, 1)
-            samples.setdefault(name, []).extend(cos_theta.tolist())
+        for triplet_name, (_, _, cos_theta) in graph["tri_len"].items():
+            samples.setdefault(triplet_name, []).extend(cos_theta.clamp(-1, 1).tolist())
     return samples
 
 
@@ -97,12 +97,12 @@ def initial_lam(scales, cos_samples, triplet_names, temperature, eps_init_ev, ep
 
 def initial_cos_theta0(triplet_names, cos_samples):
     cos_theta0 = {}
-    for name in triplet_names:
-        samples = cos_samples.get(name, [])
+    for triplet_name in triplet_names:
+        samples = cos_samples.get(triplet_name, [])
         if len(samples) > 20:
-            cos_theta0[name] = float(np.clip(np.mean(samples), -0.999, 0.999))
+            cos_theta0[triplet_name] = float(np.clip(np.mean(samples), -0.999, 0.999))
         else:
-            cos_theta0[name] = TETRAHEDRAL_COS
+            cos_theta0[triplet_name] = TETRAHEDRAL_COS
     return cos_theta0
 
 
@@ -118,14 +118,17 @@ def initialise_parameters(dataset, temperature, eps_init_ev, eps_init_default):
                                   eps_init_ev, eps_init_default)
     cos_theta0_init = initial_cos_theta0(triplets, cos_samples)
 
-    eps        = {b: trainable(eps_init_ev.get(b, eps_init_default) * EV_TO_HARTREE) for b in bonds}
-    raw_A      = {b: trainable(math.log(A_INIT))                  for b in bonds}
-    raw_B      = {b: trainable(softplus_inv(B_INIT))              for b in bonds}
-    raw_p      = {b: trainable(P_INIT)                            for b in bonds}
-    raw_q      = {b: trainable(Q_INIT)                            for b in bonds}
-    raw_gamma  = {b: trainable(softplus_inv(GAMMA_INIT))          for b in bonds}
-    raw_lam    = {t: trainable(math.log(max(lam_init[t], 1e-10))) for t in triplets}
-    raw_theta0 = {t: trainable(math.atanh(cos_theta0_init[t]))    for t in triplets}
+    eps = {bond: trainable(eps_init_ev.get(bond, eps_init_default) * EV_TO_HARTREE)
+           for bond in bonds}
+    raw_A = {bond: trainable(math.log(A_INIT)) for bond in bonds}
+    raw_B = {bond: trainable(softplus_inv(B_INIT)) for bond in bonds}
+    raw_p = {bond: trainable(P_INIT) for bond in bonds}
+    raw_q = {bond: trainable(Q_INIT) for bond in bonds}
+    raw_gamma = {bond: trainable(softplus_inv(GAMMA_INIT)) for bond in bonds}
+    raw_lam = {triplet: trainable(math.log(max(lam_init[triplet], 1e-10)))
+               for triplet in triplets}
+    raw_theta0 = {triplet: trainable(math.atanh(cos_theta0_init[triplet]))
+                  for triplet in triplets}
 
     return {
         "eps":        eps,
@@ -141,20 +144,20 @@ def initialise_parameters(dataset, temperature, eps_init_ev, eps_init_default):
     }
 
 
-def epoch_rmse(batches_per_qd, params, train, optimizer=None):
+def epoch_rmse(batches_per_dataset, params, train, optimizer=None):
 
-    qd_order = list(range(len(batches_per_qd)))
+    dataset_order = list(range(len(batches_per_dataset)))
     if train:
-        random.shuffle(qd_order)
-    qd_rmses = []
-    for qd_idx in qd_order:
-        qd_batches = batches_per_qd[qd_idx]
-        batch_order = list(range(len(qd_batches)))
+        random.shuffle(dataset_order)
+    squared_error_sum = 0.0
+    force_component_count = 0
+    for dataset_index in dataset_order:
+        dataset_batches = batches_per_dataset[dataset_index]
+        batch_order = list(range(len(dataset_batches)))
         if train:
             random.shuffle(batch_order)
-        qd_total = 0.0
-        for idx in batch_order:
-            batch     = qd_batches[idx]
+        for batch_index in batch_order:
+            batch     = dataset_batches[batch_index]
             predicted = sw_forces(batch, params)[batch["fit_mask"]]
             target    = batch["dft_forces"][batch["fit_mask"]]
             loss      = force_rmse(predicted, target)
@@ -167,9 +170,10 @@ def epoch_rmse(batches_per_qd, params, train, optimizer=None):
                         params["eps"][bond].clamp_(min=1e-4)
                         params["raw_p"][bond].clamp_(min=0.0)
                         params["raw_q"][bond].clamp_(min=0.0)
-            qd_total += loss.item()
-        qd_rmses.append(qd_total / len(qd_batches))
-    return sum(qd_rmses) / len(qd_rmses) * FORCE_AU_TO_EV_ANG
+            difference = predicted.detach() - target
+            squared_error_sum += (difference ** 2).sum().item()
+            force_component_count += difference.numel()
+    return math.sqrt(squared_error_sum / force_component_count) * FORCE_AU_TO_EV_ANG
 
 
 def train(config, output_dir):
@@ -177,18 +181,19 @@ def train(config, output_dir):
     results_dir = os.path.join(output_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
     logfile = open(os.path.join(results_dir, "training.log"), "w")
-
-    def log(message):
-        print(message)
-        logfile.write(message + "\n")
-        logfile.flush()
+    log = partial(log_message, logfile)
 
     training    = config["training"]
     temperature = training.get("training_temperature", 650)
+    random_seed = int(training.get("random_seed", 0))
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
 
     dataset = DFTDataset(config["datasets"], config["scope"],
                          first_n_frames=training.get("first_n_frames"),
                          n_train=training.get("n_train_frames"),
+                         validation_split=training.get("validation_split"),
                          val_stride=training.get("val_stride", 1))
     t_after_load = time.time()
     dataset.build_graphs()
@@ -199,22 +204,17 @@ def train(config, output_dir):
     t_after_init = time.time()
 
     batch_size = training["batch_size"]
-    val_frac   = training["validation_split"]
-    train_batches_per_qd, val_batches_per_qd = [], []
-    log("\nPer-QD train/val split (train = first n_train_frames, val = remainder):")
-    for ds_cfg, qd_graphs in zip(dataset._datasets, dataset.graphs_per_dataset):
-        if training.get("n_train_frames") is not None:
-            qd_train = [g for g in qd_graphs if g["is_train"]]
-            qd_val   = [g for g in qd_graphs if not g["is_train"]]
-        else:
-            n_val_qd = max(1, int(len(qd_graphs) * val_frac))
-            qd_train = qd_graphs[:-n_val_qd]
-            qd_val   = qd_graphs[-n_val_qd:]
-        train_batches_per_qd.append([make_batch(qd_train[i:i+batch_size])
-                                     for i in range(0, len(qd_train), batch_size)])
-        val_batches_per_qd.append([make_batch(qd_val[i:i+batch_size])
-                                   for i in range(0, len(qd_val), batch_size)])
-        log(f"  {ds_cfg['name']}: {len(qd_train)} train / {len(qd_val)} val frames")
+    train_batches_per_dataset, validation_batches_per_dataset = [], []
+    log("\nPer-dataset train/validation split:")
+    for dataset_record, dataset_graphs in zip(dataset.datasets, dataset.graphs_per_dataset):
+        training_graphs = [graph for graph in dataset_graphs if graph["is_train"]]
+        validation_graphs = [graph for graph in dataset_graphs if not graph["is_train"]]
+        train_batches_per_dataset.append([make_batch(training_graphs[i:i + batch_size])
+                                          for i in range(0, len(training_graphs), batch_size)])
+        validation_batches_per_dataset.append([make_batch(validation_graphs[i:i + batch_size])
+                                               for i in range(0, len(validation_graphs), batch_size)])
+        log(f"  {dataset_record['name']}: {len(training_graphs)} train / "
+            f"{len(validation_graphs)} validation frames")
     t_after_batches = time.time()
 
     optimizer = torch.optim.Adam(
@@ -232,18 +232,18 @@ def train(config, output_dir):
     train_history, val_history = [], []
 
     val_every = int(training.get("val_every", 1))
-    last_val  = float("inf")
+    last_val  = float("nan")
 
     log(f"\n{'Epoch':>6} | {'Train':>10} | {'Val':>10} | {'LR':>9} | {'Elapsed':>9} | imp")
     for epoch in range(1, max_epochs + 1):
-        train_rmse = epoch_rmse(train_batches_per_qd, params, train=True, optimizer=optimizer)
+        train_rmse = epoch_rmse(train_batches_per_dataset, params, train=True, optimizer=optimizer)
         scheduler.step()
 
         do_val   = (epoch % val_every == 0) or (epoch == max_epochs)
         improved = False
         if do_val:
             with torch.no_grad():
-                last_val = epoch_rmse(val_batches_per_qd, params, train=False)
+                last_val = epoch_rmse(validation_batches_per_dataset, params, train=False)
             if last_val < best_val:
                 best_val   = last_val
                 best_state = {key: {name: t.item() for name, t in params[key].items()}
@@ -260,6 +260,8 @@ def train(config, output_dir):
 
     t_after_train = time.time()
 
+    if best_state is None:
+        raise RuntimeError("Training finished without a finite validation result")
     with torch.no_grad():
         for key in TRAINABLE:
             for name, value in best_state[key].items():
@@ -324,10 +326,11 @@ def write_outputs(results_dir, dataset, params, best_val,
     log(f"  {'Bond':>8}  {'eps (eV)':>10}  {'A':>8}  {'B':>8}  "
         f"{'p':>6}  {'q':>6}  {'gamma':>7}  {'a':>7}")
     for bond in sorted(final):
-        d = final[bond]
-        log(f"  {bond:>8}  {d['eps_eV']:>10.4f}  {d['A']:>8.4f}  {d['B']:>8.4f}  "
-            f"  {d['p']:>6.3f}  {d['q']:>6.3f}  {d['gamma']:>7.4f}  "
-            f"{d['a']:>7.4f}")
+        bond_parameters = final[bond]
+        log(f"  {bond:>8}  {bond_parameters['eps_eV']:>10.4f}  "
+            f"{bond_parameters['A']:>8.4f}  {bond_parameters['B']:>8.4f}  "
+            f"  {bond_parameters['p']:>6.3f}  {bond_parameters['q']:>6.3f}  "
+            f"{bond_parameters['gamma']:>7.4f}  {bond_parameters['a']:>7.4f}")
     log("\n  Fitted 3-body angular term per triplet "
         "(lambda dimensionless; strength = lambda*sqrt(eps_ca*eps_cb)):")
     log(f"    {'Triplet':>12}  {'lambda':>10}  {'strength (eV)':>14}  {'cos_theta0':>11}  {'theta0':>7}")
@@ -356,7 +359,10 @@ def write_outputs(results_dir, dataset, params, best_val,
     plots_dir = os.path.join(results_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
     plot_training(train_history, val_history, os.path.join(plots_dir, "training_curves.png"))
-    plot_force_parity(dataset, params, os.path.join(plots_dir, "force_parity.png"))
+    plot_force_parity(dataset, params, os.path.join(plots_dir, "force_parity_training.png"),
+                      split="training")
+    plot_force_parity(dataset, params, os.path.join(plots_dir, "force_parity_validation.png"),
+                      split="validation")
     plot_sw_potentials(params, os.path.join(plots_dir, "sw_potentials.png"))
 
     from .lammps_export import export_lammps
@@ -366,10 +372,12 @@ def write_outputs(results_dir, dataset, params, best_val,
 def main():
     import argparse
     parser = argparse.ArgumentParser(
+        prog="sw-fitter",
         description="SW fitter: trains eps, A, B, p, q, gamma per bond and lambda, theta0 per triplet (cutoff fixed from RDF)"
     )
     parser.add_argument("config", help="config YAML")
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args   = parser.parse_args()
     config = load_config(args.config)
     output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.config))

@@ -7,10 +7,18 @@ SIGMA_RATIO_MIN, SIGMA_RATIO_MAX = 1.0, 2.0
 SIGMA_FIXED_POINT_ITERS = 4
 
 
-def sw_sigma_ratio(B, a, p, q, n=100):
-    B = float(B); a = float(a); p = float(p); q = float(q)
-    x = torch.linspace(1.001, a - 1e-3, n, dtype=torch.float64)
-    ratio = float(x[torch.argmin((B * x ** (-p) - x ** (-q)) * torch.exp(1.0 / (x - a)))])
+def sw_sigma_ratio(B, a, p, q, grid_size=100):
+    B = float(B)
+    a = float(a)
+    p = float(p)
+    q = float(q)
+    sigma_ratio_grid = torch.linspace(
+        1.001, a - 1e-3, grid_size, dtype=torch.float64
+    )
+    potential_shape = (
+        B * sigma_ratio_grid ** (-p) - sigma_ratio_grid ** (-q)
+    ) * torch.exp(1.0 / (sigma_ratio_grid - a))
+    ratio = float(sigma_ratio_grid[torch.argmin(potential_shape)])
     return min(max(ratio, SIGMA_RATIO_MIN), SIGMA_RATIO_MAX)
 
 

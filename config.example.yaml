@@ -1,24 +1,25 @@
 datasets:
-  - name: QD_NAME
-    xyz: /Path/to/QD.extxyz
+  - name: CdSe_300K
+    xyz: data/CdSe_300K.extxyz
     skip_frames: 500
     first_n_frames: 1000
 
 scope:
-  fit_elements: [Cd, Se] #whatever the inorganic atoms you want to fit are
+  fit_elements: [Cd, Se]
   ligand_bond_elements: [O]
 
-eps_init:          # eV, per bond — initial guess only (eps trains); any bond not listed uses eps_init_default
+eps_init:
   Cd-Se: 1.0
-  Cd-O:  0.5
+  Cd-O: 0.5
   Cd-Cd: 0.01
   Se-Se: 0.01
-  O-Se:  0.01
+  O-Se: 0.01
 eps_init_default: 0.01
 
 training:
+  random_seed: 0
   learning_rate: 0.0025
-  min_lr: 1e-4
+  min_lr: 1.0e-4
   batch_size: 64
   max_epochs: 400
   validation_split: 0.15

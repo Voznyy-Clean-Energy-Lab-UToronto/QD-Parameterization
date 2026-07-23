@@ -21,11 +21,12 @@ BOND_MAX_ANG = 7.0 #Screen distance to search for bond distance from RDF (minima
 
 #reads the trajectory using ASE, assumes extxyz format. Regardless of DFT program please convert (and include forces).
 #can easily be done using DPData https://github.com/deepmodeling/dpdata
-def read_trajectory(filepath, first_n=None, skip_n=None, n_train=None, val_stride=1):
+def read_trajectory(filepath, first_n=None, skip_n=None, n_train=None,
+                    validation_fraction=None, val_stride=1):
     frames = ase.io.read(filepath, index=":", format="extxyz")
-    if skip_n:
+    if skip_n is not None:
         frames = frames[skip_n:] #skip first n number of frames from extxyz
-    if first_n:
+    if first_n is not None:
         frames = frames[:first_n] #only train on first n number of frames (after skip_n). so skip_n = 500, first_n = 1000 means
                                   #program is trained on frames [500, 1501]
 
@@ -35,6 +36,10 @@ def read_trajectory(filepath, first_n=None, skip_n=None, n_train=None, val_strid
         val_frames = frames[n_train::val_stride]
         frames = train_frames + val_frames
         is_train = [True] * len(train_frames) + [False] * len(val_frames)
+    elif validation_fraction is not None:
+        n_validation = max(1, int(len(frames) * validation_fraction))
+        n_training = len(frames) - n_validation
+        is_train = [True] * n_training + [False] * n_validation
 
     #checks elements present from first frame and assumes this won't change. this program will not work if
     # no. of each atom is changing
@@ -72,19 +77,19 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
         histogram += np.histogram(distances, bins=bin_edges)[0]
         coordination += (distances < bond_max_bohr).sum() / len(atoms_a)
 
-    g = histogram / np.maximum(bin_centres ** 2, 1e-12)
-    g = np.convolve(g, np.ones(3) / 3, mode="same")
+    rdf_values = histogram / np.maximum(bin_centres ** 2, 1e-12)
+    rdf_values = np.convolve(rdf_values, np.ones(3) / 3, mode="same")
 
-    if g.max() < 1e-10:
+    if rdf_values.max() < 1e-10:
         return None
 
-    r0_bohr = float(bin_centres[np.argmax(g)])
+    r0_bohr = float(bin_centres[np.argmax(rdf_values)])
 
 
     after_peak = (bin_centres > r0_bohr) & (bin_centres < r0_bohr + 2.0 * ANGSTROM_TO_BOHR)
     if after_peak.sum() < 2:
         return None
-    first_min_bohr = float(bin_centres[after_peak][np.argmin(g[after_peak])])
+    first_min_bohr = float(bin_centres[after_peak][np.argmin(rdf_values[after_peak])])
 
     coordination = coordination / len(sampled_positions_bohr)
 
@@ -93,7 +98,7 @@ def bond_geometry_from_rdf(sampled_positions_bohr, atoms_a, atoms_b, same_elemen
 
 def measure_pair_geometry(sampled_positions_bohr, symbols, elements, fit_elements, ligand_elements):
     symbols = np.array(symbols)
-    atoms_of_element = {e: np.where(symbols == e)[0] for e in elements}
+    atoms_of_element = {element: np.where(symbols == element)[0] for element in elements}
 
     geometry_by_bond = {}
     for element_a, element_b in combinations_with_replacement(elements, 2):
@@ -119,19 +124,21 @@ def measure_pair_geometry(sampled_positions_bohr, symbols, elements, fit_element
 
 def measure_pair_scales_all_datasets(datasets, fit_elements, ligand_elements):
     observations = {}
-    for ds in datasets:
-        n_tr = sum(ds["is_train"]) if ds.get("is_train") is not None else len(ds["positions"])
-        train_positions = ds["positions"][:n_tr]
+    for dataset_record in datasets:
+        train_positions = dataset_record["positions"]
+        if dataset_record.get("is_train") is not None:
+            train_positions = [positions for positions, is_training in
+                               zip(train_positions, dataset_record["is_train"]) if is_training]
         sample = train_positions[:: max(1, len(train_positions) // 50)]
         geometry_by_bond = measure_pair_geometry(
-            [np.asarray(p) for p in sample],
-            ds["symbols"],
-            sorted(set(ds["symbols"])),
+            [np.asarray(positions) for positions in sample],
+            dataset_record["symbols"],
+            sorted(set(dataset_record["symbols"])),
             fit_elements,
             ligand_elements,
         )
         for bond, (r0_bohr, first_min_bohr) in geometry_by_bond.items():
-            observations.setdefault(bond, []).append((ds["name"], r0_bohr, first_min_bohr))
+            observations.setdefault(bond, []).append((dataset_record["name"], r0_bohr, first_min_bohr))
 
     scales = {"r0": {}, "cutoff": {}}
     print("\n2-body scales (global r0 and cutoff = median over datasets showing a clear bond):")
@@ -235,9 +242,9 @@ def compute_geometry(positions, edges, triplets):
 
 
 def make_batch(frames):
-    positions = torch.cat([f["positions"] for f in frames])
-    dft_forces = torch.cat([f["dft_forces"] for f in frames])
-    fit_mask = torch.cat([f["fit_mask"] for f in frames])
+    positions = torch.cat([frame["positions"] for frame in frames])
+    dft_forces = torch.cat([frame["dft_forces"] for frame in frames])
+    fit_mask = torch.cat([frame["fit_mask"] for frame in frames])
 
     edges, triplets, edge_len, tri_len = {}, {}, {}, {}
     offset = 0
@@ -261,10 +268,8 @@ def make_batch(frames):
         for name, (c, a, b) in triplets.items()
     }
     edge_len = {bond: torch.cat(parts) for bond, parts in edge_len.items()}
-    tri_len = {
-        name: (torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts]), torch.cat([p[2] for p in parts]))
-        for name, parts in tri_len.items()
-    }
+    tri_len = {name: tuple(torch.cat([geometry[i] for geometry in parts]) for i in range(3))
+               for name, parts in tri_len.items()}
     return {
         "positions": positions,
         "dft_forces": dft_forces,
@@ -277,43 +282,46 @@ def make_batch(frames):
 
 
 class DFTDataset:
-    def __init__(self, dataset_configs, scope, first_n_frames=None, n_train=None, val_stride=1):
+    def __init__(self, dataset_configs, scope, first_n_frames=None, n_train=None,
+                 validation_split=None, val_stride=1):
         print(f"\n{'=' * 60}\nLOADING DATA\n{'=' * 60}")
 
         self.fit_elements = set(scope["fit_elements"])
         self.ligand_elements = set(scope.get("ligand_bond_elements", []))
 
-        self._datasets = []
-        for cfg in dataset_configs:
-            print(f"\n{cfg.get('name', cfg['xyz'])}")
+        self.datasets = []
+        for dataset_config in dataset_configs:
+            print(f"\n{dataset_config.get('name', dataset_config['xyz'])}")
             symbols, positions, forces, is_train = read_trajectory(
-                cfg["xyz"],
-                first_n=cfg.get("first_n_frames", first_n_frames),
-                skip_n=cfg.get("skip_frames"),
+                dataset_config["xyz"],
+                first_n=dataset_config.get("first_n_frames", first_n_frames),
+                skip_n=dataset_config.get("skip_frames"),
                 n_train=n_train,
+                validation_fraction=None if n_train is not None else validation_split,
                 val_stride=val_stride,
             )
-            self._datasets.append({
-                "name":      cfg.get("name", ""),
+            self.datasets.append({
+                "name":      dataset_config.get("name", ""),
                 "symbols":   symbols,
                 "positions": positions,
                 "forces":    forces,
                 "is_train":  is_train,
             })
 
-        self.elements = sorted({e for ds in self._datasets for e in ds["symbols"]})
+        self.elements = sorted({element for dataset_record in self.datasets
+                                for element in dataset_record["symbols"]})
 
-        framework_elems = sorted(e for e in self.elements if e in self.fit_elements)
+        framework_elems = sorted(element for element in self.elements if element in self.fit_elements)
         self.chemical_formula = "".join(framework_elems) + "_universal"
 
-        total_frames = sum(len(ds["positions"]) for ds in self._datasets)
+        total_frames = sum(len(record["positions"]) for record in self.datasets)
         print(f"\nElements: {self.elements}")
-        print(f"{len(self._datasets)} dataset(s), {total_frames} frames total")
+        print(f"{len(self.datasets)} dataset(s), {total_frames} frames total")
 
     def build_graphs(self):
 
         self.scales = measure_pair_scales_all_datasets(
-            self._datasets, self.fit_elements, self.ligand_elements
+            self.datasets, self.fit_elements, self.ligand_elements
         )
         self.cutoffs_bohr = self.scales["cutoff"]
         self.triplet_type_names = enumerate_triplet_types(self.elements, self.cutoffs_bohr, self.fit_elements)
@@ -328,14 +336,18 @@ class DFTDataset:
             print(f"  {bond:>8}: graph radius {self.cutoffs_bohr[bond] * BOHR_TO_ANGSTROM:.2f} Å")
         self.graphs = []
         self.graphs_per_dataset = []
-        for ds in self._datasets:
-            symbols   = ds["symbols"]
+        for dataset_record in self.datasets:
+            symbols   = dataset_record["symbols"]
             fit_mask  = torch.tensor(
-                [e in self.fit_elements for e in symbols], dtype=torch.bool
+                [element in self.fit_elements for element in symbols], dtype=torch.bool
             )
-            is_train_list = ds["is_train"] if ds["is_train"] is not None else [True] * len(ds["positions"])
-            qd_graphs = []
-            for positions_bohr, forces_au, frame_is_train in zip(ds["positions"], ds["forces"], is_train_list):
+            is_train_list = dataset_record["is_train"]
+            if is_train_list is None:
+                is_train_list = [True] * len(dataset_record["positions"])
+            dataset_graphs = []
+            for positions_bohr, forces_au, frame_is_train in zip(
+                dataset_record["positions"], dataset_record["forces"], is_train_list
+            ):
                 edges = build_edges(positions_bohr, symbols, self.cutoffs_bohr)
                 if not edges:
                     continue
@@ -354,6 +366,8 @@ class DFTDataset:
                     "is_train":   frame_is_train,
                 }
                 self.graphs.append(graph)
-                qd_graphs.append(graph)
-            self.graphs_per_dataset.append(qd_graphs)
+                dataset_graphs.append(graph)
+            if not dataset_graphs:
+                raise ValueError(f"Dataset {dataset_record['name']} produced no graphs with scoped edges")
+            self.graphs_per_dataset.append(dataset_graphs)
         print(f"done ({len(self.graphs)} graphs)")

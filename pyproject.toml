@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sw-fitter"
+version = "0.48.0"
+description = "Fit a generalized Stillinger-Weber potential to reference atomic forces"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ase>=3.23",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "PyYAML>=6.0",
+    "scipy>=1.11",
+    "torch>=2.2",
+]
+
+[project.scripts]
+sw-fitter = "sw_fitter.fitter:main"
+sw-fitter-check = "sw_fitter.consistency.consistency_check:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sw_fitter*"]

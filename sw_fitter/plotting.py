@@ -20,7 +20,7 @@ def plot_training(train_history, val_history, filepath):
     ax.plot(range(1, len(val_history) + 1), val_history, label="validation")
     ax.set_xlabel("epoch")
     ax.set_ylabel("force RMSE (eV/Angstrom)")
-    ax.set_title(f"best validation RMSE = {min(val_history):.4f} eV/Angstrom")
+    ax.set_title(f"best validation RMSE = {np.nanmin(val_history):.4f} eV/Angstrom")
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
@@ -48,7 +48,8 @@ def plot_sw_potentials(params, filepath):
     r_ang_grid = np.linspace(1.5, 7.5, 5000)
     v2_min_all = 0.0
 
-    for color, bond in zip(PLOT_COLORS, bond_names):
+    for bond_index, bond in enumerate(bond_names):
+        color = PLOT_COLORS[bond_index % len(PLOT_COLORS)]
         sigma_bohr  = float(bond_sigma(bond, params))
         cutoff_bohr = float(params["cutoff"][bond])
         cutoff_ang  = cutoff_bohr * BOHR_TO_ANGSTROM
@@ -87,7 +88,8 @@ def plot_sw_potentials(params, filepath):
     cos_theta  = np.cos(np.radians(theta_deg))
     v3_max_all = 0.0
 
-    for color, triplet_name in zip(PLOT_COLORS, triplet_names):
+    for triplet_index, triplet_name in enumerate(triplet_names):
+        color = PLOT_COLORS[triplet_index % len(PLOT_COLORS)]
         centre, legs = triplet_name.split(":")
         leg_a, leg_b = legs.split("-")
         bond_ca = canonical_pair(centre, leg_a)
@@ -134,11 +136,20 @@ def plot_sw_potentials(params, filepath):
     print(f"  wrote {filepath}")
 
 
-def plot_force_parity(dataset, params, filepath):
+def plot_force_parity(dataset, params, filepath, split):
+    if split == "training":
+        selected_graphs = [graph for graph in dataset.graphs if graph["is_train"]]
+    elif split == "validation":
+        selected_graphs = [graph for graph in dataset.graphs if not graph["is_train"]]
+    else:
+        raise ValueError("split must be 'training' or 'validation'")
+    if not selected_graphs:
+        raise ValueError(f"No {split} graphs are available for force parity plotting")
+
     predicted_chunks, target_chunks = [], []
     with torch.no_grad():
-        for start in range(0, len(dataset.graphs), 16):
-            batch = make_batch(dataset.graphs[start:start+16])
+        for start in range(0, len(selected_graphs), 16):
+            batch = make_batch(selected_graphs[start:start + 16])
             mask  = batch["fit_mask"]
             predicted_chunks.append(sw_forces(batch, params)[mask].numpy())
             target_chunks.append(batch["dft_forces"][mask].numpy())
@@ -158,7 +169,7 @@ def plot_force_parity(dataset, params, filepath):
     ax.set_aspect("equal")
     ax.set_xlabel("DFT force (eV/Angstrom)")
     ax.set_ylabel("SW force (eV/Angstrom)")
-    ax.set_title("force parity")
+    ax.set_title(f"{split} force parity")
     ax.text(0.04, 0.96, f"RMSE = {rmse:.4f} eV/Å\n$R^2$ = {r2:.4f}",
             transform=ax.transAxes, va="top", fontsize=11,
             bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))

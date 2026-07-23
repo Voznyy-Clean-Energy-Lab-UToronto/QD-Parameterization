@@ -19,19 +19,23 @@ def export_lammps(results_dir, dataset, params, formula):
         f.write(f"# SW elements: {sw_elements}\n")
         f.write(f"# LAMMPS pair_coeff * * {sw_filename} " + " ".join(sw_elements) + "\n")
         f.write("# i j k  eps sigma a lambda gamma cos0 A B p q tol\n")
-        for ei in sw_elements:
-            for ej in sw_elements:
-                for ek in sw_elements:
-                    f.write(_sw_line(ei, ej, ek, params, triplet_types) + "\n")
+        for element_i in sw_elements:
+            for element_j in sw_elements:
+                for element_k in sw_elements:
+                    f.write(
+                        _sw_line(
+                            element_i, element_j, element_k, params, triplet_types
+                        ) + "\n"
+                    )
 
     print(f"  wrote {filepath} ({len(sw_elements)**3} lines)")
     print(f"  LAMMPS: pair_coeff * * {sw_filename} {' '.join(sw_elements)}")
     return sw_elements
 
 
-def _sw_line(ei, ej, ek, params, triplet_types):
-    bond_ik = canonical_pair(ei, ek)
-    bond_ij = canonical_pair(ei, ej)
+def _sw_line(element_i, element_j, element_k, params, triplet_types):
+    bond_ik = canonical_pair(element_i, element_k)
+    bond_ij = canonical_pair(element_i, element_j)
 
     if bond_ik in params["eps"]:
         eps_ev    = params["eps"][bond_ik].item() * HARTREE_TO_EV
@@ -48,7 +52,7 @@ def _sw_line(ei, ej, ek, params, triplet_types):
         sigma_ang, a_val    = 2.0, 1.5
         p_val, q_val, gamma_val = 4.0, 0.0, 1.2
 
-    triplet_name  = canonical_triplet(ei, ej, ek)
+    triplet_name  = canonical_triplet(element_i, element_j, element_k)
     parameterized = (triplet_name in triplet_types
                      and bond_ik in params["eps"]
                      and bond_ij in params["eps"]
@@ -63,7 +67,7 @@ def _sw_line(ei, ej, ek, params, triplet_types):
         lam_lammps, cos0 = 0.0, -1.0 / 3.0
 
     return (
-        f"{ei} {ej} {ek} "
+        f"{element_i} {element_j} {element_k} "
         f"{eps_ev:.10f} {sigma_ang:.10f} {a_val:.10f} "
         f"{lam_lammps:.10f} {gamma_val:.10f} {cos0:.10f} "
         f"{A_val:.10f} {B_val:.10f} {p_val:.10f} {q_val:.10f} 0.0"
